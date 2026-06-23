@@ -103,6 +103,9 @@ For every measured run we record, per condition:
 - **Call count** and, for the mesh, **`ticks_run`** and stabilized flag. Results
   are stratified by `ticks_run` because a 1-tick mesh is not evidence of the
   lateral mechanism.
+- **Survivorship fields** (mesh only): each column's `accepted: bool` tag and
+  the per-run `integration_threshold` (so the accepted-only ablation is
+  self-contained; confound C4).
 - **Quality** (external; see below).
 
 Because the server has 1 slot, `sphere_x4_no_lateral`, `mono_x4`, and a 1-tick
@@ -125,9 +128,24 @@ No embeddings, so quality uses a same-server **pairwise blind judge**:
   sample; treat judge scores as **provisional** until a distinct stronger judge
   is available.
 
-Primary comparison is **blind-judge score at equal call count** (`mesh_adaptive`
-1-tick vs `mono_x4`) and **at equal single-call** (`mesh_adaptive` vs
-`mono_all_prompts`), each normalized by total inference tokens.
+Comparisons are deliberately separated into three questions:
+
+1. **Diversity/compute (no mechanism):** does having 4 different sphere prompts
+   beat a single prompt? `sphere_x4_no_lateral` (4 diverse calls, no voting) vs
+   `mono_x4` (4 identical calls) vs `mono_all_prompts` (1 call). These ARE
+   equal-call-count or single-call and fair as stated.
+2. **Mechanism:** does lateral voting on top of diversity help? The ONLY honest
+   comparison is `mesh_adaptive` at `ticks_run ≥ 2` (lateral context is non-empty)
+   vs `sphere_x4_no_lateral`. Note: a `mesh_adaptive` run that stops at tick 1 is
+   **identical** to `sphere_x4_no_lateral` (same calls, no lateral context) and
+   carries NO mechanism signal — so this comparison is only valid for runs that
+   reach tick ≥ 2, and it is **inherently compute-asymmetric** (8 calls vs 4):
+   report quality normalized by call count, never as a raw win. A future
+   `sphere_x8_no_lateral` control (each sphere called twice independently, no
+   voting) would make the mechanism comparison equal-call-count; it is on the
+   roadmap for the scaled run.
+3. All quality comparisons are **blind-judge**, normalized by total inference
+   tokens and call count.
 
 ## Prompt set (pilot)
 

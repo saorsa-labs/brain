@@ -491,8 +491,9 @@ async fn run_mono_x4(
     Ok((serde_json::Value::Array(out), MeshExtras::default()))
 }
 
-/// The monolithic prompt: all 4 sphere prompts (equal instruction budget, confound
-/// C2) + the nonce-bearing task from the stimulus. `response_format: json_object`
+/// The monolithic prompt: all 4 sphere prompts (union instruction budget plus
+/// a minimal combining instruction — NOT token-equal to the mesh; confound C2)
+/// and the nonce-bearing task from the stimulus. `response_format: json_object`
 /// is forced by the engine for all conditions.
 fn mono_prompt(stimulus: &Stimulus) -> String {
     format!(
@@ -641,8 +642,9 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
     s.push_str("- **Token economy has no quality meaning yet** — without a judge score, cost-effectiveness is uninterpretable.\n");
     s.push_str("- **Gross / cache-adjusted / cache-hit% must be read together** — no single token column is a fair headline cost.\n");
     s.push_str("- **`mean_confidence` and accept-rate are self-reported mechanism internals, NOT quality evidence.**\n");
-    s.push_str("- **Only compare equal call counts** — a 1-tick mesh (4 calls) ≈ `sphere_x4_no_lateral` ≈ `mono_x4`; a 2-tick mesh (8 calls) is NOT comparable to `mono_x4`.\n");
-    s.push_str("- **A 1-tick mesh is NOT evidence of the lateral mechanism** — it bypasses lateral exchange entirely.\n");
+    s.push_str("- **Only compare equal call counts** — a 1-tick mesh (4 calls) = `sphere_x4_no_lateral` (IDENTICAL calls, not just same count) = `mono_x4`; a 2-tick mesh (8 calls) is NOT comparable to `mono_x4`.\n");
+    s.push_str("- **`mesh_adaptive` vs `sphere_x4_no_lateral` is a QUALITY comparison control, not a latency/token race** — equal call counts make it fair to compare, but a latency/token delta alone does NOT prove lateral voting helps.\n");
+    s.push_str("- **A 1-tick mesh is NOT evidence of the lateral mechanism** — it is IDENTICAL to `sphere_x4_no_lateral`; only `ticks_run >= 2` runs exercise lateral exchange.\n");
     s.push_str("- **n is tiny** — pilot deltas are directional only; no headline claim until judge + ≥50-prompt scaled run.\n\n");
 
     s.push_str("## Per-condition aggregate (all prompts × repeats)\n\n");
@@ -745,6 +747,23 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
             }
             s.push_str("\n> ⚠️ Only `ticks_run == 1` rows are call-matched to `sphere_x4_no_lateral` / `mono_x4`. Higher-tick mesh rows spend more calls and are NOT directly comparable.\n");
         }
+    }
+
+    // Silent-degeneracy guard: if mesh_adaptive never reaches ticks>=2, the
+    // lateral mechanism was never exercised (every run == sphere_x4_no_lateral).
+    let mesh_adaptive: Vec<&AnswerRunRecord> = records
+        .iter()
+        .filter(|r| r.condition == "mesh_adaptive")
+        .collect();
+    let max_tick_seen = mesh_adaptive
+        .iter()
+        .filter_map(|r| r.ticks_run)
+        .max()
+        .unwrap_or(0);
+    if max_tick_seen <= 1 && !mesh_adaptive.is_empty() {
+        s.push_str(&format!(
+            "\n> 🛑 **MECHANISM UNMEASURED THIS ROUND.** All `mesh_adaptive` runs converged at tick 1 (max ticks_run = {max_tick_seen}), so they are IDENTICAL to `sphere_x4_no_lateral`. The lateral-voting mechanism was never exercised. To measure the mechanism, force runs that reach ticks >= 2 (e.g. raise `min_mean_confidence` or raise `--max-ticks` and disable early-stop).\n"
+        ));
     }
 
     let parsefails = records.iter().filter(|r| !r.parse_ok).count();
