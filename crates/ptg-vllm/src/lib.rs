@@ -55,6 +55,9 @@ pub struct EngineCallMetrics {
     pub model: String,
     /// `finish_reason` of the first choice, if reported (`"stop"`, `"length"`...).
     pub finish_reason: Option<String>,
+    /// Whether ANY choice was truncated (`finish_reason == "length"`). Robust to
+    /// multi-choice responses. The benchmark flags this as a scored failure.
+    pub truncated: bool,
     /// `usage.prompt_tokens`.
     pub prompt_tokens: Option<u32>,
     /// `usage.completion_tokens`.
@@ -266,6 +269,15 @@ impl ChatCompletionResponse {
     fn first_finish_reason(&self) -> Option<String> {
         self.choices.first().and_then(|c| c.finish_reason.clone())
     }
+
+    /// True if ANY choice ended with `finish_reason == "length"`, i.e. the output
+    /// was truncated by the token cap. Robust to multi-choice responses (a later
+    /// choice may truncate even if the first did not).
+    fn any_truncated(&self) -> bool {
+        self.choices
+            .iter()
+            .any(|c| c.finish_reason.as_deref() == Some("length"))
+    }
 }
 
 /// OpenAI-style `usage` block. All fields optional: older/trimmed responses may
@@ -415,6 +427,7 @@ impl InferenceEngine {
         let latency = start.elapsed();
 
         let finish_reason = parsed.first_finish_reason();
+        let truncated = parsed.any_truncated();
         let metrics = EngineCallMetrics {
             completed_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -423,6 +436,7 @@ impl InferenceEngine {
             latency_ms: latency.as_millis() as u64,
             model: self.model.clone(),
             finish_reason,
+            truncated,
             prompt_tokens: parsed.usage.prompt_tokens,
             completion_tokens: parsed.usage.completion_tokens,
             total_tokens: parsed.usage.total_tokens,
@@ -739,6 +753,22 @@ mod tests {
         assert_eq!(parsed.usage.prompt_tokens, None);
         assert_eq!(parsed.usage.cached_tokens(), None);
         assert_eq!(parsed.first_finish_reason(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn any_truncated_detects_length_on_any_choice() -> Result<(), Box<dyn std::error::Error>> {
+        // First choice stops cleanly, a later choice truncated: must still flag.
+        let body = r#"{"choices":[
+            {"message":{"content":"a"},"finish_reason":"stop"},
+            {"message":{"content":"b"},"finish_reason":"length"}
+        ]}"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body)?;
+        assert!(parsed.any_truncated());
+        // Single clean choice must not flag.
+        let clean = r#"{"choices":[{"message":{"content":"a"},"finish_reason":"stop"}]}"#;
+        let parsed_clean: ChatCompletionResponse = serde_json::from_str(clean)?;
+        assert!(!parsed_clean.any_truncated());
         Ok(())
     }
 

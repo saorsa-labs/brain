@@ -38,11 +38,25 @@ use serde::Serialize;
 /// Benchmark generation settings (fixed for determinism across all conditions).
 const BENCH_TEMPERATURE: f32 = 0.0;
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum, Serialize)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Serialize, PartialEq, Eq)]
 enum Condition {
+    /// The PTG mesh: 4 sphere columns + lateral voting + convergence. Primary
+    /// artifact = ALL columns (unfiltered). Stratify results by `ticks_run`.
     MeshAdaptive,
+    /// One monolithic call with all 4 sphere prompts + the task (equal
+    /// instruction *union*, plus a minimal combining instruction). 1 call.
     MonoAllPrompts,
+    /// 4 IDENTICAL monolithic calls (same prompt). At temp 0 these are 4
+    /// identical outputs — a degenerate compute-only control (C1) that does NOT
+    /// separate prompt-diversity from the mechanism. Relegated to a secondary
+    /// control by the methodology.
     MonoX4,
+    /// 4 sphere-specialized calls with NO lateral context and NO voting
+    /// (implemented as a 1-tick mesh). This is the PRIMARY mechanism control:
+    /// `mesh_adaptive` = diverse columns + voting; `sphere_x4_no_lateral` =
+    /// diverse columns − voting. The difference isolates the cortical
+    /// mechanism from prompt diversity.
+    SphereX4NoLateral,
 }
 
 impl Condition {
@@ -51,6 +65,7 @@ impl Condition {
             Self::MeshAdaptive => "mesh_adaptive",
             Self::MonoAllPrompts => "mono_all_prompts",
             Self::MonoX4 => "mono_x4",
+            Self::SphereX4NoLateral => "sphere_x4_no_lateral",
         }
     }
 }
@@ -111,11 +126,16 @@ struct AnswerRunRecord {
     completion_tokens_gross: Option<u64>,
     total_tokens_gross: Option<u64>,
     cached_tokens_gross: Option<u64>,
-    /// total_tokens_gross − cached_tokens_gross (count the prefix once, ever).
+    /// `prompt_tokens_gross − cached_tokens_gross` (count each cached prefix
+    /// once; completion tokens excluded). The prompt-portion cache adjustment.
+    prompt_tokens_cache_adjusted: Option<u64>,
+    /// `total_tokens_gross − cached_tokens_gross` = `(prompt−cached)+completion`
+    /// = true compute-equivalent cost (completion is never cached).
     total_tokens_cache_adjusted: Option<u64>,
     cache_hit_rate: Option<f64>,
     finish_reasons: Vec<Option<String>>,
-    /// Truncation flag: any call ended with `finish_reason == "length"`.
+    /// Truncation flag: any call ended with `finish_reason == "length"`
+    /// (robust to multi-choice responses).
     truncated: bool,
     /// End-to-end wall-clock latency of the condition run (ms).
     wall_latency_ms: u64,
@@ -127,6 +147,9 @@ struct AnswerRunRecord {
     mean_confidence: Option<f32>,
     accepted_count: Option<u32>,
     rejected_count: Option<u32>,
+    /// Confidence threshold used for the accepted/rejected split (recorded so
+    /// the C4 ablation is self-contained). `None` for non-mesh conditions.
+    integration_threshold: Option<f32>,
     parse_ok: bool,
     error: Option<String>,
     per_call: Vec<EngineCallMetrics>,
@@ -148,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(c) => vec![c],
         None => vec![
             Condition::MeshAdaptive,
+            Condition::SphereX4NoLateral,
             Condition::MonoAllPrompts,
             Condition::MonoX4,
         ],
@@ -324,6 +348,7 @@ async fn run_one(
         completion_tokens_gross: None,
         total_tokens_gross: None,
         cached_tokens_gross: None,
+        prompt_tokens_cache_adjusted: None,
         total_tokens_cache_adjusted: None,
         cache_hit_rate: None,
         finish_reasons: Vec::new(),
@@ -335,6 +360,7 @@ async fn run_one(
         mean_confidence: None,
         accepted_count: None,
         rejected_count: None,
+        integration_threshold: None,
         parse_ok: false,
         error: None,
         per_call: Vec::new(),
@@ -349,6 +375,7 @@ async fn run_one(
     ));
     let outcome: Result<(serde_json::Value, MeshExtras), String> = match cond {
         Condition::MeshAdaptive => run_mesh(mesh_engine, &stimulus, args).await,
+        Condition::SphereX4NoLateral => run_mesh_one_tick(mesh_engine, &stimulus).await,
         Condition::MonoAllPrompts => run_mono_once(mono_engine, &stimulus).await,
         Condition::MonoX4 => run_mono_x4(mono_engine, &stimulus).await,
     };
@@ -366,6 +393,7 @@ async fn run_one(
             rec.mean_confidence = extras.mean_confidence;
             rec.accepted_count = extras.accepted_count;
             rec.rejected_count = extras.rejected_count;
+            rec.integration_threshold = extras.integration_threshold;
             rec.parse_ok = true;
         }
         Err(msg) => {
@@ -383,6 +411,8 @@ struct MeshExtras {
     mean_confidence: Option<f32>,
     accepted_count: Option<u32>,
     rejected_count: Option<u32>,
+    /// Integration threshold used for the accepted/rejected split (C4 ablation).
+    integration_threshold: Option<f32>,
 }
 
 async fn run_mesh(
@@ -392,11 +422,12 @@ async fn run_mesh(
 ) -> Result<(serde_json::Value, MeshExtras), String> {
     let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
     mesh.criteria.max_ticks = args.max_ticks;
+    let threshold = mesh.criteria.min_integration_confidence;
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
     let outputs: Vec<serde_json::Value> = result
         .outputs
         .iter()
-        .map(|(id, schema)| canonical_column(id, schema))
+        .map(|(id, schema)| canonical_column(id, schema, threshold))
         .collect();
     let extras = MeshExtras {
         ticks_run: Some(result.ticks_run),
@@ -404,6 +435,36 @@ async fn run_mesh(
         mean_confidence: Some(result.mean_confidence),
         accepted_count: Some(result.accepted_outputs.len() as u32),
         rejected_count: Some(result.rejected_outputs.len() as u32),
+        integration_threshold: Some(threshold),
+    };
+    Ok((serde_json::Value::Array(outputs), extras))
+}
+
+/// `sphere_x4_no_lateral` — the PRIMARY mechanism control. Runs the default mesh
+/// with `max_ticks = 1`: 4 sphere-specialized column calls, empty lateral
+/// context (no prior ticks), no voting/convergence. Reuses the same engine/path
+/// and per-sphere validation as `mesh_adaptive`, so the ONLY difference vs a
+/// 2-tick `mesh_adaptive` is the absence of lateral exchange + integration.
+async fn run_mesh_one_tick(
+    engine: &Arc<dyn ptg_vllm::ColumnEngine>,
+    stimulus: &Stimulus,
+) -> Result<(serde_json::Value, MeshExtras), String> {
+    let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
+    mesh.criteria.max_ticks = 1;
+    let threshold = mesh.criteria.min_integration_confidence;
+    let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
+    let outputs: Vec<serde_json::Value> = result
+        .outputs
+        .iter()
+        .map(|(id, schema)| canonical_column(id, schema, threshold))
+        .collect();
+    let extras = MeshExtras {
+        ticks_run: Some(result.ticks_run),
+        stabilized: Some(result.stabilized),
+        mean_confidence: Some(result.mean_confidence),
+        accepted_count: Some(result.accepted_outputs.len() as u32),
+        rejected_count: Some(result.rejected_outputs.len() as u32),
+        integration_threshold: Some(threshold),
     };
     Ok((serde_json::Value::Array(outputs), extras))
 }
@@ -444,10 +505,11 @@ fn mono_prompt(stimulus: &Stimulus) -> String {
     )
 }
 
-fn canonical_column(id: &str, schema: &ColumnOutputSchema) -> serde_json::Value {
+fn canonical_column(id: &str, schema: &ColumnOutputSchema, threshold: f32) -> serde_json::Value {
     serde_json::json!({
         "column_id": id,
         "sphere": sphere_name(schema),
+        "accepted": schema.confidence >= threshold,
         "schema": schema,
     })
 }
@@ -474,9 +536,8 @@ fn aggregate_metrics(rec: &mut AnswerRunRecord, calls: &[EngineCallMetrics]) {
     rec.call_count = calls.len() as u32;
     rec.sum_call_latency_ms = calls.iter().map(|c| c.latency_ms).sum();
     rec.finish_reasons = calls.iter().map(|c| c.finish_reason.clone()).collect();
-    rec.truncated = calls
-        .iter()
-        .any(|c| c.finish_reason.as_deref() == Some("length"));
+    // Robust to multi-choice responses: flag truncation if ANY call truncated.
+    rec.truncated = calls.iter().any(|c| c.truncated);
 
     rec.prompt_tokens_gross = sum_opt(calls.iter().map(|c| c.prompt_tokens));
     rec.completion_tokens_gross = sum_opt(calls.iter().map(|c| c.completion_tokens));
@@ -490,8 +551,11 @@ fn aggregate_metrics(rec: &mut AnswerRunRecord, calls: &[EngineCallMetrics]) {
         } else {
             Some(cached as f64 / gross as f64)
         };
+        // Prompt-portion cache adjustment: count each cached prefix once.
+        rec.prompt_tokens_cache_adjusted = Some(gross.saturating_sub(cached));
     }
     if let (Some(total), Some(cached)) = (rec.total_tokens_gross, rec.cached_tokens_gross) {
+        // Compute-equivalent total: (prompt−cached)+completion = total−cached.
         rec.total_tokens_cache_adjusted = Some(total.saturating_sub(cached));
     }
 }
@@ -567,11 +631,19 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
         args.repeats
     ));
     s.push_str(
-        "\n> **PILOT.** Latency and token-economy numbers only. No headline quality claim.\n",
+        "\n> ⚠️ **PILOT — harness validation only.** Latency and token-economy numbers only. No headline quality claim.\n",
     );
     s.push_str(
         "> Quality (LLM-as-judge) is a separate follow-up step per `docs/BENCHMARKING.md`.\n\n",
     );
+    s.push_str("### How NOT to read these numbers\n\n");
+    s.push_str("- **Wall latency is not a speedup claim** — the server has 1 slot, so mesh fan-out serializes; use `sum_call_lat`, not `wall_lat`, for cross-condition latency.\n");
+    s.push_str("- **Token economy has no quality meaning yet** — without a judge score, cost-effectiveness is uninterpretable.\n");
+    s.push_str("- **Gross / cache-adjusted / cache-hit% must be read together** — no single token column is a fair headline cost.\n");
+    s.push_str("- **`mean_confidence` and accept-rate are self-reported mechanism internals, NOT quality evidence.**\n");
+    s.push_str("- **Only compare equal call counts** — a 1-tick mesh (4 calls) ≈ `sphere_x4_no_lateral` ≈ `mono_x4`; a 2-tick mesh (8 calls) is NOT comparable to `mono_x4`.\n");
+    s.push_str("- **A 1-tick mesh is NOT evidence of the lateral mechanism** — it bypasses lateral exchange entirely.\n");
+    s.push_str("- **n is tiny** — pilot deltas are directional only; no headline claim until judge + ≥50-prompt scaled run.\n\n");
 
     s.push_str("## Per-condition aggregate (all prompts × repeats)\n\n");
     s.push_str("| condition | n | parse_ok | wall_lat ms (med/min/max) | sum_call_lat ms (med) | gross total tok (med) | cache-adj total tok (med) | cached% (med) | calls (med) | truncated |\n");
@@ -610,25 +682,69 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
         ));
     }
 
-    // Mesh-specific detail.
-    let mesh: Vec<&AnswerRunRecord> = records
-        .iter()
-        .filter(|r| r.condition == "mesh_adaptive")
-        .collect();
-    if !mesh.is_empty() {
-        s.push_str("\n## mesh_adaptive detail\n\n");
+    // Mesh-specific detail, stratified by ticks_run (red-team guard: a 1-tick
+    // run is NOT evidence of the lateral mechanism).
+    for mesh_cond in ["mesh_adaptive", "sphere_x4_no_lateral"] {
+        let mesh: Vec<&AnswerRunRecord> = records
+            .iter()
+            .filter(|r| r.condition == mesh_cond)
+            .collect();
+        if mesh.is_empty() {
+            continue;
+        }
+        let title = if mesh_cond == "mesh_adaptive" {
+            "mesh_adaptive"
+        } else {
+            "sphere_x4_no_lateral (mechanism control)"
+        };
+        s.push_str(&format!("\n## {title} detail\n\n"));
         let ticks: Vec<u32> = mesh.iter().filter_map(|r| r.ticks_run).collect();
         let stabilized = mesh.iter().filter(|r| r.stabilized == Some(true)).count();
-        let meanconf: Vec<f32> = mesh.iter().filter_map(|r| r.mean_confidence).collect();
+        let meanconf: Vec<f64> = mesh
+            .iter()
+            .filter_map(|r| r.mean_confidence.map(|x| x as f64))
+            .collect();
         s.push_str(&format!(
-            "- ticks_run: min={} max={} | stabilized(c1): {}/{} | mean_confidence (med): {:.3}\n",
+            "- ticks_run: min={} max={} | stabilized: {}/{} | mean_confidence (med): {} (self-reported, NOT quality)\n",
             ticks.iter().copied().min().unwrap_or(0),
             ticks.iter().copied().max().unwrap_or(0),
             stabilized,
             mesh.len(),
-            median_f(&meanconf.iter().map(|x| *x as f64).collect::<Vec<_>>()),
+            median_f(&meanconf),
         ));
-        s.push_str("- NOTE: a 1-tick run is 4 parallel independent calls with NO lateral exchange; stratify before drawing mechanism conclusions.\n");
+
+        // Stratification table by ticks_run.
+        let mut tick_buckets: std::collections::BTreeMap<u32, Vec<&AnswerRunRecord>> =
+            std::collections::BTreeMap::new();
+        for r in &mesh {
+            if let Some(t) = r.ticks_run {
+                tick_buckets.entry(t).or_default().push(r);
+            }
+        }
+        if tick_buckets.len() > 1 || !tick_buckets.is_empty() {
+            s.push_str("\n| ticks_run | n | calls (med) | gross total tok (med) | total cache-adj tok (med) | wall_lat ms (med) | sum_call_lat ms (med) |\n");
+            s.push_str("|---|---|---|---|---|---|---|\n");
+            for (t, bucket) in &tick_buckets {
+                let calls: Vec<u64> = bucket.iter().map(|r| r.call_count as u64).collect();
+                let gross: Vec<u64> = bucket.iter().filter_map(|r| r.total_tokens_gross).collect();
+                let cadj: Vec<u64> = bucket
+                    .iter()
+                    .filter_map(|r| r.total_tokens_cache_adjusted)
+                    .collect();
+                let wall: Vec<u64> = bucket.iter().map(|r| r.wall_latency_ms).collect();
+                let sumc: Vec<u64> = bucket.iter().map(|r| r.sum_call_latency_ms).collect();
+                s.push_str(&format!(
+                    "| {t} | {} | {} | {} | {} | {} | {} |\n",
+                    bucket.len(),
+                    median(&calls),
+                    median_opt(&gross),
+                    median_opt(&cadj),
+                    median(&wall),
+                    median(&sumc),
+                ));
+            }
+            s.push_str("\n> ⚠️ Only `ticks_run == 1` rows are call-matched to `sphere_x4_no_lateral` / `mono_x4`. Higher-tick mesh rows spend more calls and are NOT directly comparable.\n");
+        }
     }
 
     let parsefails = records.iter().filter(|r| !r.parse_ok).count();
@@ -637,12 +753,10 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
     }
 
     s.push_str("\n## Confound accounting (per `docs/BENCHMARKING.md`)\n\n");
-    s.push_str("- **C1 compute**: mono_x4 matches a 1-tick mesh call count; compare quality-per-call / quality-per-token at the judge step.\n");
-    s.push_str(
-        "- **C3 cache**: gross and cache-adjusted totals both reported; cache-hit% shown.\n",
-    );
-    s.push_str("- **C4 survivorship**: mesh `outputs` are ALL columns (unfiltered); accepted/rejected counts recorded for the ablation.\n");
-    s.push_str("- Finish truncation (`finish_reason == length`) flagged per condition.\n");
+    s.push_str("- **C1 compute**: `sphere_x4_no_lateral` (4 diverse sphere calls, no voting) is the PRIMARY mechanism control; `mono_x4` (4 identical calls, degenerate at temp 0) is a secondary compute-only control. Compare at equal call count.\n");
+    s.push_str("- **C3 cache**: gross, prompt-cache-adjusted (`prompt−cached`), total-cache-adjusted (`total−cached`), and cache-hit% all reported per record.\n");
+    s.push_str("- **C4 survivorship**: mesh `outputs` are ALL columns (unfiltered), each tagged `accepted`; `integration_threshold` recorded. Accepted-only is the ablation.\n");
+    s.push_str("- Finish truncation (`finish_reason == length`, robust to multi-choice) flagged per condition.\n");
     s
 }
 

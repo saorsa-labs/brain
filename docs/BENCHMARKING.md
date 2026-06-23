@@ -35,9 +35,9 @@ a naive comparison toward the mesh and must be neutralized.
 
 | ID | Confound | Mitigation in this design |
 |----|----------|---------------------------|
-| **C1** | "More compute = better": the mesh spends `4 × ticks` calls vs the baseline's 1, so any quality win is confounded with compute. | (1) **Always report quality normalized by total inference tokens AND by call count.** (2) **Add a compute-matched baseline** (`mono_x4`): 4 independent monolithic calls at the same total call budget as a 1-tick mesh. (3) Never select "best-of-4 by judge" as primary — that is oracle selection. If a single answer is needed from `mono_x4`, use a **predefined non-oracle rule** (e.g. highest self-reported confidence) and report it as an ablation; prefer recording all four. |
-| **C2** | Prompt-verbosity: the mesh carries ~4 specialized system prompts; a short generic baseline rewards verbosity, not mechanism. | The monolithic baseline receives **all four PTG sphere prompts concatenated** (the union budget), so total instruction context is equal across `mono_*` and mesh. |
-| **C3** | Prefix-cache asymmetry + token double-counting: the mesh reuses 4 stable prefixes across ticks; naive summing double-counts cached tokens; naive subtraction makes the mesh look artificially cheap. | **Report gross `prompt_tokens`, `cached_tokens`, and `completion_tokens` separately per condition** — never a single "true cost" number. Also report **cache-adjusted = `prompt_tokens − cached_tokens` per call** with the cache-hit rate. Measure **cold and warm separately**; discard the first run per side as warmup. |
+| **C1** | "More compute = better": the mesh spends `4 × ticks` calls vs the baseline's 1, so any quality win is confounded with compute. | The **PRIMARY mechanism control is `sphere_x4_no_lateral`** (4 diverse sphere calls, no voting). `mono_x4` (4 identical calls) is a secondary compute-only control that is **degenerate at `temperature: 0`** (4 identical outputs) and does not separate prompt-diversity from the mechanism. Report quality normalized by total inference tokens AND by call count; only compare at **equal call count** (stratify `mesh_adaptive` by `ticks_run`). Never select "best-of-4 by judge" as primary (oracle selection). |
+| **C2** | Prompt-verbosity: the mesh carries ~4 specialized system prompts; a short generic baseline rewards verbosity, not mechanism. | The monolithic baseline receives **the union of the four PTG sphere prompts plus a minimal combining instruction** (so it produces a parseable multi-perspective object). This is **not token-equal** to the mesh (the monolith also gets the combining instruction); the delta is small, acknowledged, and the actual `prompt_tokens` of both are recorded. |
+| **C3** | Prefix-cache asymmetry + token double-counting: the mesh reuses 4 stable prefixes across ticks; naive summing double-counts cached tokens; naive subtraction makes the mesh look artificially cheap. | **Report gross `prompt_tokens`, `cached_tokens`, and `completion_tokens` separately per condition.** Two cache-adjusted views are emitted, both named explicitly: **`prompt_tokens_cache_adjusted = prompt − cached`** (counts each cached prefix once; completion excluded) and **`total_tokens_cache_adjusted = total − cached = (prompt−cached)+completion`** (true compute-equivalent cost, since completion is never cached). Also report the **cache-hit rate**. **v0 measures WARM only** (cold is not implemented); the first run per side is discarded as warmup. |
 | **C4** | Self-selection / survivorship: the mesh rejects sub-threshold columns; confidence is self-reported; comparing mesh-accepted vs baseline-raw is best-of-filtered vs raw. | (1) **Primary mesh artifact = ALL columns (unfiltered)**; accepted-only is a **secondary ablation** that quantifies the filter's contribution, never the headline. (2) Because confidence is self-reported, **all mesh internal metrics (`mean_confidence`, `stabilized`, accept-rate) are treated as non-evidence for quality**; quality is scored externally only. |
 
 ## Conditions (generators)
@@ -50,14 +50,22 @@ settings (see "Fixed settings").
    convergence (adaptive ticks), accepted/rejected split. Evaluated on **all
    columns** (primary) and accepted-only (ablation).
 
-2. **`mono_all_prompts`** — a single chat-completion call whose prompt is **all
-   four PTG sphere prompts concatenated** plus the task. Tests the mechanism at
-   equal instruction budget but 1 call. Completion cap = `4 × per-column cap`.
+2. **`sphere_x4_no_lateral`** — **the PRIMARY mechanism control.** The default
+   mesh run with `max_ticks = 1`: 4 sphere-specialized column calls with empty
+   lateral context (no prior ticks) and no voting/convergence, reusing the same
+   engine path and per-sphere validation as the mesh. This isolates the cortical
+   mechanism: `mesh_adaptive` = diverse columns **+** voting; this condition =
+   diverse columns **−** voting. The difference is the mechanism's contribution.
 
-3. **`mono_x4`** — **4 independent** `mono_all_prompts` calls (same prompt, same
-   task), matching the call count of a 1-tick mesh. All four raw outputs are
-   recorded. Any single-answer reduction uses a **non-oracle rule** (highest
-   self-reported confidence), reported as an ablation.
+3. **`mono_all_prompts`** — a single chat-completion call whose prompt is **all
+   four PTG sphere prompts concatenated** plus the task and a minimal combining
+   instruction. Tests the mechanism at equal instruction *union* but 1 call.
+   Completion cap = `4 × per-column cap`.
+
+4. **`mono_x4`** — **4 identical** `mono_all_prompts` calls (same prompt, same
+   task). At `temperature: 0` these produce 4 identical outputs, so this is a
+   **degenerate compute-only control** (C1) that does NOT separate
+   prompt-diversity from the mechanism. It is relegated to a secondary control.
 
 There is **no common LLM "integration pass"** applied to the generators' outputs
 in v0 — it would change the system under test and add its own compute confound.
@@ -88,13 +96,18 @@ For every measured run we record, per condition:
 - **Latency**: (a) **wall-clock end-to-end** (includes queueing at the 1-slot
   server) and (b) **sum of per-call latency** (compute-equivalent). Both reported.
 - **Tokens**: gross `prompt_tokens`, `cached_tokens`, `completion_tokens`,
-  `total_tokens`; plus cache-adjusted (`prompt − cached`) and cache-hit rate.
-- **Call count** and, for the mesh, **`ticks_run`** and stabilized flag.
+  `total_tokens`; plus two cache-adjusted views — **`prompt_tokens_cache_adjusted`
+  = `prompt − cached`** (counts each cached prefix once; completion excluded) and
+  **`total_tokens_cache_adjusted = total − cached`** = `(prompt−cached)+completion`
+  (true compute-equivalent cost) — and the cache-hit rate.
+- **Call count** and, for the mesh, **`ticks_run`** and stabilized flag. Results
+  are stratified by `ticks_run` because a 1-tick mesh is not evidence of the
+  lateral mechanism.
 - **Quality** (external; see below).
 
-Because the server has 1 slot, `mono_x4` and a 1-tick `mesh_adaptive` have the
-**same call count** — making the quality-per-call and quality-per-token
-comparisons the scientifically central ones.
+Because the server has 1 slot, `sphere_x4_no_lateral`, `mono_x4`, and a 1-tick
+`mesh_adaptive` all have the **same call count** (4) — making the quality-per-call
+and quality-per-token comparisons the scientifically central ones.
 
 ## Quality (LLM-as-judge, provisional)
 
@@ -119,17 +132,20 @@ Primary comparison is **blind-judge score at equal call count** (`mesh_adaptive`
 ## Prompt set (pilot)
 
 Five diverse, deliberately multi-domain prompts (each meaningfully exercises
-Physics+Math+Coding+Psychology), used verbatim. Captured in
-`crates/ptg-cli/data/bench-prompts.json`. Per-domain stratification is recorded
-so no single domain dominates (confound L3).
+Physics+Math+Coding+Psychology), used verbatim. They are hardcoded in
+`crates/ptg-cli/src/bin/ptg-bench.rs::default_prompts`. Per-domain
+stratification is recorded so no single domain dominates (confound L3).
 
 ## Run protocol
 
-- **Pilot first**: 5 prompts × 3 repeats × 3 conditions, **warm**. This run
+- **v0 measures WARM only.** Cold-cache measurement (server restart before
+  each trial) is **not implemented** in v0; if it matters, note cold as not
+  measured. The warmup runs warm the static sphere-prompt prefixes.
+- **Pilot first**: 5 prompts × 3 repeats × 4 conditions, **warm**. This run
   **validates the harness and gives a directional read only** — explicitly **no
   headline quality conclusion**.
-- Warmup: discard the first run per condition (cold cache). Interleave condition
-  order with a fixed seed so thermal/drift is shared.
+- Warmup: one discarded run per condition (cold cache / order effects, confound
+  L2). Interleave condition order with a fixed seed so thermal/drift is shared.
 - A **cold smoke pass** (server restart before one trial) is recorded if practical;
   otherwise cold is noted as not measured this round.
 - Deterministic run nonce per trial (after the static prompt prefix, before the
