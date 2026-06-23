@@ -24,15 +24,28 @@ PTG is built incrementally against the [specification](./SPECIFICATION.md) and
 - [x] Panic-free, clippy-clean (`-D warnings`), 30 unit tests (mock engine, no
       live server required).
 
-## Phase 2 — Real inference & multi-modality
+## Phase 2 — Real inference & multi-modality ✅
 
-- [ ] End-to-end run against a live vLLM server (§7.1) and validate the
-      `Gemma-4-2B-Multimodal-Q4_K_M` model id and prefix-caching behavior.
-- [ ] Reference-frame JSON schema validation per modality (reject outputs that
-      don't conform to the column's frame).
-- [ ] True multimodal stimulus (image/audio) through the multimodal engine.
-- [ ] Confidence-aware filtering in global integration (drop low-confidence
-      columns from the final percept — §6 Phase 3).
+- [x] End-to-end run against a **live** OpenAI-compatible server: validated
+      against a local `llama.cpp` `llama-server` (`gemma-4-e4b`); a 2-tick text
+      epoch converged in 1 tick at mean confidence ~0.94–0.98 with all four
+      columns passing strict per-sphere schema validation. (`ptg --probe`,
+      `list_models`, and an `#[ignore]` live integration test were added.)
+- [x] Reference-frame JSON schema validation per sphere
+      (`ColumnOutputSchema::validate_for_sphere`, enforced in the engine).
+- [x] Multimodal stimulus (image/audio): `Stimulus`/`StimulusPart` serialize to
+      the exact OpenAI content-array shapes; CLI `--image-url`/`--image-detail`.
+      Unit-tested, **not** live-validated (no multimodal model running).
+- [x] Confidence-aware filtering in global integration (`accepted_outputs` /
+      `rejected_outputs` at `min_integration_confidence`, §6 Phase 3).
+- [x] Panic-free, clippy-clean (`-D warnings`); 32 unit tests + live epoch run.
+- [ ] Deferred security hardening (see ARCHITECTURE "Security posture"): the
+      red-team review found **0 critical** issues for the local-trusted-server
+      posture, but SSRF via arbitrary `--vllm-url`, unbounded payloads, and
+      verbatim output printing are documented to revisit before exposing the
+      CLI to untrusted input.
+
+## Phase 3 — Topologies & convergence depth (next)
 
 ## Phase 3 — Topologies & convergence depth
 
