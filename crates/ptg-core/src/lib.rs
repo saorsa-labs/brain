@@ -110,6 +110,18 @@ impl DomainSphere {
             Self::Psychology => PROMPT_PSYCHOLOGY,
         }
     }
+
+    /// The domain-specific keys this sphere's output must contain (§5 prompts).
+    /// Used by [`ColumnOutputSchema::validate_for_sphere`].
+    #[must_use]
+    pub const fn required_fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Physics => &["isolated_variables", "empirical_observation"],
+            Self::Mathematics => &["axiomatic_assertions", "deductive_synthesis"],
+            Self::Coding => &["state_variables", "algorithmic_analysis"],
+            Self::Psychology => &["cognitive_biases", "behavioral_synthesis"],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +256,9 @@ pub enum SchemaError {
     /// Confidence fell outside `[0.0, 1.0]`.
     #[error("confidence {0} out of range [0.0, 1.0]")]
     ConfidenceOutOfRange(f32),
+    /// A domain-specific field required by the column's sphere was absent.
+    #[error("output missing required field for its sphere: {0}")]
+    MissingRequiredField(String),
 }
 
 /// The structured JSON every column emits.
@@ -279,6 +294,109 @@ impl ColumnOutputSchema {
             return Err(SchemaError::ConfidenceOutOfRange(self.confidence));
         }
         Ok(())
+    }
+
+    /// Validate the output against a sphere's required domain-specific fields.
+    ///
+    /// Runs [`validate`](Self::validate) first, then asserts the sphere's
+    /// required keys are *present* in `domain_fields` (presence only; value
+    /// types are not enforced, to avoid over-validating model output).
+    ///
+    /// # Errors
+    /// - Any [`SchemaError`] from [`validate`](Self::validate).
+    /// - [`SchemaError::MissingRequiredField`] for the first missing key.
+    pub fn validate_for_sphere(&self, sphere: DomainSphere) -> Result<(), SchemaError> {
+        self.validate()?;
+        for required in sphere.required_fields() {
+            if !self.domain_fields.contains_key(*required) {
+                return Err(SchemaError::MissingRequiredField((*required).to_string()));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stimulus (§2.3 afferent pathway, multimodal extension)
+// ---------------------------------------------------------------------------
+
+/// Resolution hint for an image stimulus part (OpenAI `detail`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageDetail {
+    Low,
+    High,
+    #[default]
+    Auto,
+}
+
+/// Audio container format for an audio stimulus part (OpenAI `format`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioFormat {
+    Wav,
+    Mp3,
+}
+
+/// One non-text component of a multimodal stimulus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StimulusPart {
+    /// An image referenced by URL (including inline `data:image/...;base64,...`).
+    ImageUrl { image_url: ImageUrlRef },
+    /// Inline audio as base64-encoded data.
+    InputAudio { input_audio: InputAudioRef },
+}
+
+/// The `image_url` object nested under an [`StimulusPart::ImageUrl`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageUrlRef {
+    pub url: String,
+    #[serde(default)]
+    pub detail: ImageDetail,
+}
+
+/// The `input_audio` object nested under an [`StimulusPart::InputAudio`].
+///
+/// `data` is forwarded to the server verbatim; per the OpenAI schema it must be
+/// raw base64 (NOT a `data:audio/...;base64,...` URI).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputAudioRef {
+    pub data: String,
+    pub format: AudioFormat,
+}
+
+/// The afferent stimulus broadcast to all columns during an epoch (§2.3, §6).
+///
+/// `Text` is the common case; `Multimodal` carries image/audio parts alongside
+/// a text anchor. Both variants expose their text portion via [`Stimulus::text_str`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Stimulus {
+    /// Text-only stimulus.
+    Text(String),
+    /// Text plus one or more non-text parts.
+    Multimodal {
+        text: String,
+        parts: Vec<StimulusPart>,
+    },
+}
+
+impl Stimulus {
+    /// Construct a text-only stimulus.
+    #[must_use]
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text(s.into())
+    }
+
+    /// The text portion of the stimulus (the whole string for `Text`, the
+    /// `text` field for `Multimodal`).
+    #[must_use]
+    pub fn text_str(&self) -> &str {
+        match self {
+            Self::Text(s) => s,
+            Self::Multimodal { text, .. } => text,
+        }
     }
 }
 
@@ -446,5 +564,82 @@ mod tests {
         assert!((col.last_confidence - 0.42).abs() < 1e-6);
         assert_eq!(col.current_coordinate, "1,2,3");
         assert_eq!(col.history_buffer.len(), 1);
+    }
+
+    #[test]
+    fn validate_for_sphere_accepts_complete_output() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{
+            "reference_frame_coordinates": "x",
+            "isolated_variables": ["v"],
+            "empirical_observation": "obs",
+            "prediction": "p",
+            "confidence": 0.5
+        }"#;
+        let out: ColumnOutputSchema = serde_json::from_str(json)?;
+        assert!(out.validate_for_sphere(DomainSphere::Physics).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn validate_for_sphere_rejects_missing_field() {
+        let out = ColumnOutputSchema {
+            reference_frame_coordinates: "x".into(),
+            prediction: "p".into(),
+            confidence: 0.5,
+            domain_fields: BTreeMap::new(), // missing isolated_variables + empirical_observation
+        };
+        let result = out.validate_for_sphere(DomainSphere::Physics);
+        assert!(
+            matches!(result, Err(SchemaError::MissingRequiredField(_))),
+            "expected MissingRequiredField, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn stimulus_text_helpers() {
+        let s = Stimulus::text("hello");
+        assert_eq!(s.text_str(), "hello");
+        let m = Stimulus::Multimodal {
+            text: "caption".into(),
+            parts: vec![],
+        };
+        assert_eq!(m.text_str(), "caption");
+    }
+
+    #[test]
+    fn multimodal_stimulus_serializes_openai_shapes() -> Result<(), Box<dyn std::error::Error>> {
+        let parts = vec![
+            StimulusPart::ImageUrl {
+                image_url: ImageUrlRef {
+                    url: "data:image/png;base64,AAAA".into(),
+                    detail: ImageDetail::High,
+                },
+            },
+            StimulusPart::InputAudio {
+                input_audio: InputAudioRef {
+                    // OpenAI `input_audio.data` is raw base64; forwarded verbatim.
+                    data: "Bg==".into(),
+                    format: AudioFormat::Wav,
+                },
+            },
+        ];
+        let json = serde_json::to_string(&parts)?;
+        assert!(
+            json.contains(r#""type":"image_url""#),
+            "image part must use type=image_url: {json}"
+        );
+        assert!(
+            json.contains(r#""type":"input_audio""#),
+            "audio part must use type=input_audio: {json}"
+        );
+        assert!(
+            json.contains(r#""image_url":{"url":"data:image/png;base64,AAAA","detail":"high"}"#),
+            "nested image_url object wrong: {json}"
+        );
+        assert!(
+            json.contains(r#""input_audio":{"data":"Bg==","format":"wav"}"#),
+            "nested input_audio object wrong: {json}"
+        );
+        Ok(())
     }
 }

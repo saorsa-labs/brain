@@ -2,7 +2,7 @@
 
 > A distributed, prompt-based **cortical mesh simulator** written in Rust — implementing the organizational principles of Jeff Hawkins' *Thousand Brains Theory of Intelligence* as a multi-agent system.
 
-[![status](https://img.shields.io/badge/status-v1%20execution%20skeleton-brightgreen)](docs/ROADMAP.md)
+[![status](https://img.shields.io/badge/status-phase%202%20done-brightgreen)](docs/ROADMAP.md)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange)](#getting-started)
 
@@ -40,11 +40,11 @@ By leveraging unified memory architectures on modern high-end developer workstat
 ```
 brain/
 ├── crates/
-│   ├── ptg-core        # CorticalColumn, DomainSphere, ColumnOutputSchema, HistoryBuffer, PROMPT_*
-│   ├── ptg-vllm        # Shared inference engine ("thalamus"): ColumnEngine trait + reqwest InferenceEngine
+│   ├── ptg-core        # CorticalColumn, ColumnOutputSchema (validate_for_sphere), Stimulus/multimodal, PROMPT_*
+│   ├── ptg-vllm        # Shared inference engine ("thalamus"): ColumnEngine trait + reqwest InferenceEngine, list_models
 │   ├── ptg-consensus   # Convergence math (mean/delta/cosine over confidence vectors, ndarray)
 │   ├── ptg-runtime     # CorticalMesh: 3-phase epoch loop (fan-out + lateral injection + integration)
-│   └── ptg-cli         # `ptg` binary (clap + tracing, --dry-run)
+│   └── ptg-cli         # `ptg` binary (--image-url, --image-detail, --probe, --dry-run)
 └── docs/               # Specification, architecture, roadmap
 ```
 
@@ -59,15 +59,22 @@ cargo run -p ptg-cli
 
 ## Status
 
-The **V1 execution skeleton** is implemented and panic-free: a compiling Rust
-workspace encoding the domain model, a shared `InferenceEngine` client, the
-three-phase epoch loop with lateral context injection, metric-based convergence,
-and a `ptg` CLI (with `--dry-run` for offline validation). It is unit-tested
-with a mock engine — no live vLLM server is required to build or test. Running
-real inference needs a local vLLM server (see [§7.1](docs/SPECIFICATION.md)).
+Phases 0–2 are complete and panic-free. The workspace implements the domain
+model, a shared `InferenceEngine` client, the three-phase epoch loop with
+lateral context injection and metric-based convergence, and a `ptg` CLI.
+
+**Phase 2** added: a `Stimulus` model (text + multimodal image/audio serializing
+to the OpenAI content-array shapes), per-sphere reference-frame schema
+validation, confidence-aware global integration (`accepted`/`rejected_outputs`),
+and a live-inference harness (`--probe` + an `#[ignore]` integration test). It
+was **validated end-to-end against a live `llama.cpp` server** (`gemma-4-e4b`):
+a 2-tick text epoch converged in 1 tick at mean confidence 0.94 with all four
+columns passing strict per-sphere validation. 32 unit tests; clippy-clean
+(`-D warnings`).
 
 Next phases — weighted/attention routing, full semantic convergence, true
-multimodality, and benchmarks — are tracked in the [roadmap](docs/ROADMAP.md).
+multimodal *live* validation, and benchmarks — are tracked in the
+[roadmap](docs/ROADMAP.md).
 
 ## Documentation
 

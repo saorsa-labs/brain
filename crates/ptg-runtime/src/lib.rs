@@ -18,7 +18,7 @@ use std::sync::Arc;
 use futures::future::join_all;
 use ndarray::Array1;
 use ptg_consensus::{confidence_vector, mean_confidence, quality_converged, ConvergenceCriteria};
-use ptg_core::{ColumnOutputSchema, CorticalColumn};
+use ptg_core::{ColumnOutputSchema, CorticalColumn, Stimulus};
 use ptg_vllm::{ColumnEngine, EngineError};
 
 /// Errors raised by mesh construction or execution.
@@ -146,7 +146,7 @@ impl CorticalMesh {
     ///
     /// # Errors
     /// [`MeshError::Engine`] if any column's tick fails (fail-fast).
-    pub async fn run_epoch(&mut self, input_payload: &str) -> Result<MeshResult, MeshError> {
+    pub async fn run_epoch(&mut self, stimulus: &Stimulus) -> Result<MeshResult, MeshError> {
         let max_ticks = self.criteria.max_ticks;
         let engine = Arc::clone(&self.engine);
         let mut previous_conf: Array1<f32> = Array1::zeros(0);
@@ -172,9 +172,9 @@ impl CorticalMesh {
             // Phase 1 + 2 exec: concurrent column ticks against the shared engine.
             let futures = tasks.into_iter().map(|(id, col, ctx)| {
                 let engine = Arc::clone(&engine);
-                let input = input_payload.to_string();
+                let stimulus = stimulus.clone();
                 async move {
-                    let result = engine.execute_column_tick(&col, &input, &ctx).await;
+                    let result = engine.execute_column_tick(&col, &stimulus, &ctx).await;
                     (id, result)
                 }
             });
@@ -214,12 +214,27 @@ impl CorticalMesh {
 
         let refs: Vec<&CorticalColumn> = self.column_ids_sorted_local_refs();
         let mean = mean_confidence(&refs);
+        let threshold = self.criteria.min_integration_confidence;
+        let (accepted_outputs, rejected_outputs) = last_outputs
+            .iter()
+            .cloned()
+            .partition::<Vec<_>, _>(|(_, out)| out.confidence >= threshold);
         Ok(MeshResult {
             ticks_run,
             outputs: last_outputs,
+            accepted_outputs,
+            rejected_outputs,
             mean_confidence: mean,
             stabilized,
         })
+    }
+
+    /// Convenience: run an epoch over a text-only stimulus.
+    ///
+    /// # Errors
+    /// [`MeshError::Engine`] if any column's tick fails (fail-fast).
+    pub async fn run_text_epoch(&mut self, input: &str) -> Result<MeshResult, MeshError> {
+        self.run_epoch(&Stimulus::text(input)).await
     }
 
     /// Borrow the columns in sorted-id order (helper to satisfy borrow checker).
@@ -236,8 +251,12 @@ impl CorticalMesh {
 pub struct MeshResult {
     /// Number of ticks actually executed (may be less than `max_ticks`).
     pub ticks_run: u32,
-    /// Final per-column outputs from the last executed tick.
+    /// Final per-column outputs from the last executed tick (all columns).
     pub outputs: Vec<(String, ColumnOutputSchema)>,
+    /// Outputs whose confidence met the integration threshold (§6 Phase 3).
+    pub accepted_outputs: Vec<(String, ColumnOutputSchema)>,
+    /// Outputs filtered out of the global percept for low confidence.
+    pub rejected_outputs: Vec<(String, ColumnOutputSchema)>,
     /// Mean confidence across columns at the end of the epoch.
     pub mean_confidence: f32,
     /// Whether a quality convergence criterion was met (vs. running out of ticks).
@@ -276,7 +295,7 @@ mod tests {
         async fn execute_column_tick(
             &self,
             column: &CorticalColumn,
-            _input: &str,
+            _stimulus: &ptg_core::Stimulus,
             _lateral: &str,
         ) -> Result<ColumnOutputSchema, VllmEngineError> {
             let prediction = format!("{}-prediction", column.sphere.as_str());
@@ -336,11 +355,13 @@ mod tests {
         for (from, to) in ptg_core::default_connections() {
             mesh.establish_lateral_connection(from, to)?;
         }
-        let result = mesh.run_epoch("stimulus").await?;
+        let result = mesh.run_text_epoch("stimulus").await?;
         assert_eq!(result.outputs.len(), 4);
         assert!(result.stabilized, "high-confidence mock should converge");
         assert_eq!(result.ticks_run, 1);
         assert!(result.mean_confidence >= 0.8);
+        assert_eq!(result.accepted_outputs.len(), 4, "all high-conf accepted");
+        assert!(result.rejected_outputs.is_empty());
         Ok(())
     }
 
@@ -354,7 +375,7 @@ mod tests {
         async fn execute_column_tick(
             &self,
             column: &CorticalColumn,
-            _input: &str,
+            _stimulus: &ptg_core::Stimulus,
             _lateral: &str,
         ) -> Result<ColumnOutputSchema, VllmEngineError> {
             Ok(ColumnOutputSchema {
@@ -371,10 +392,16 @@ mod tests {
     {
         let mut mesh = default_mesh(Arc::new(LowConfEngine))?;
         mesh.criteria.max_ticks = 3;
-        let result = mesh.run_epoch("stimulus").await?;
+        let result = mesh.run_text_epoch("stimulus").await?;
         assert_eq!(result.outputs.len(), 4);
         assert_eq!(result.ticks_run, 2, "should converge via delta on tick 2");
         assert!(result.stabilized);
+        assert_eq!(
+            result.accepted_outputs.len(),
+            0,
+            "0.3 conf below default 0.5 threshold"
+        );
+        assert_eq!(result.rejected_outputs.len(), 4);
         for (_id, out) in &result.outputs {
             assert!(out.prediction.ends_with("-pred"));
             assert!((0.0..=1.0).contains(&out.confidence));

@@ -25,10 +25,11 @@ shipped implementation refines the §8 reference blueprint for production.
 
 | Crate | Spec section | Key types |
 | --- | --- | --- |
-| `ptg-core` | §3.1.2, §5, §8.1 | `DomainSphere`, `CorticalColumn`, `HistoryBuffer`, `ColumnOutputSchema`, `PROMPT_*`, `default_columns`, `default_connections` |
-| `ptg-vllm` | §3.1.1, §8.3 | `ColumnEngine` trait, `InferenceEngine`, `EngineBuilder`, `EngineError` |
-| `ptg-consensus` | §6 Phase 3 | `ConvergenceCriteria`, `mean_confidence`, `confidence_vector`, `cosine_similarity`, `quality_converged` |
-| `ptg-runtime` | §3.1.3, §6, §8.2 | `CorticalMesh`, `MeshResult`, `MeshError`, `default_mesh` |
+| `ptg-core` | §3.1.2, §5, §8.1 | `DomainSphere`, `CorticalColumn`, `HistoryBuffer`, `ColumnOutputSchema` (`validate`, `validate_for_sphere`), `Stimulus`/`StimulusPart`/`ImageDetail`/`AudioFormat`, `PROMPT_*`, `default_columns`, `default_connections` |
+| `ptg-vllm` | §3.1.1, §8.3 | `ColumnEngine` trait (`execute_column_tick(&Stimulus)`), `InferenceEngine`, `EngineBuilder`, `EngineError`, `list_models` |
+| `ptg-consensus` | §6 Phase 3 | `ConvergenceCriteria` (`min_integration_confidence`), `mean_confidence`, `confidence_vector`, `cosine_similarity`, `quality_converged` |
+| `ptg-runtime` | §3.1.3, §6, §8.2 | `CorticalMesh` (`run_epoch(&Stimulus)`, `run_text_epoch`), `MeshResult` (`accepted_outputs`/`rejected_outputs`), `MeshError`, `default_mesh` |
+| `ptg-cli` | §8.4 | `ptg` binary (`--image-url`, `--image-detail`, `--probe`, `--dry-run`) |
 | `ptg-cli` | §8.4 | `ptg` binary (`clap` args, `--dry-run`) |
 
 ## The three-phase epoch loop (§6)
@@ -53,8 +54,8 @@ shipped implementation refines the §8 reference blueprint for production.
               |
               v
   +-----------------------+   Phase 3: global integration
-  | MeshResult            |   - final outputs, mean confidence, stabilized flag
-  +-----------------------+
+  | MeshResult            |   - outputs, accepted/rejected split (threshold),
+  +-----------------------+     mean confidence, stabilized flag
 ```
 
 1. Column ids are processed in **sorted order** for reproducible consensus
@@ -62,6 +63,9 @@ shipped implementation refines the §8 reference blueprint for production.
 2. The fan-out uses `futures::future::join_all` over the shared `Arc`'d engine.
 3. Engine errors **fail fast** (`MeshError::Engine`) rather than being silently
    swallowed (unlike the `eprintln`/`None` path in the §8 reference).
+4. **Confidence-aware integration** (Phase 2): final outputs are partitioned
+   into `accepted_outputs` (confidence ≥ `min_integration_confidence`, default
+   0.5) and `rejected_outputs` (§6 Phase 3 "filters out low-confidence columns").
 
 ## Convergence (§6 Phase 3, "Compute Cosine Matrix Convergence")
 
@@ -94,6 +98,10 @@ provenance):
 | `serde_json::Value` indexing of the response | typed `ChatCompletionResponse` structs | Robust parsing |
 | `eprintln` + continue on engine error | fail-fast `MeshError::Engine` | Errors surface instead of being swallowed |
 | Non-deterministic `HashMap` tick order | sorted column ids | Reproducible consensus |
+| `execute_column_tick(column, input_data: &str, lateral)` | `execute_column_tick(column, stimulus: &Stimulus, lateral)` — text serializes as a plain string, multimodal as the OpenAI content-part array (text part first, then `image_url`/`input_audio`) | §2.3 multi-modality (Phase 2) |
+| No per-sphere output validation | `ColumnOutputSchema::validate_for_sphere` enforces each sphere's required domain fields; called in `execute_column_tick` | §5 reference frames (Phase 2) |
+| No confidence filtering | `MeshResult` splits into `accepted_outputs`/`rejected_outputs` at `min_integration_confidence` | §6 Phase 3 (Phase 2) |
+| No reachability check | `ptg --probe` / `list_models` | Operational (Phase 2) |
 
 ## Adjacency model (V1)
 
@@ -102,13 +110,37 @@ the prose mentions "weight voting", §9.1 itself defers dynamic, attention-
 weighted routing to future work — so unweighted topology is correct for V1 and
 weighted edges stay on the [roadmap](./ROADMAP.md).
 
+## Security posture (Phase 2 review)
+
+`ptg` is a single-user local dev CLI talking to a **trusted** local inference
+server. The red-team review found **zero critical** issues in that posture.
+Documented, accepted limitations (not Phase 2 blockers — tracked if the CLI is
+ever exposed to untrusted input):
+
+- **SSRF / data exfil via arbitrary `--vllm-url`** (reqwest follows redirects).
+  Acceptable for a trusted local server; revisit before exposing the CLI as a
+  service.
+- **Unbounded response parsing / payload sizes** — a malicious *server* could
+  return huge JSON. Trusted-server assumption.
+- **Model/server output printed verbatim** — could in principle inject terminal
+  escapes. Low risk for local use.
+
 ## Running it
 
 ```bash
 cargo check --workspace --all-targets
 cargo clippy --all-features --all-targets -- -D warnings
-cargo test
+cargo test                                      # unit tests (live test is #[ignore])
 cargo run -p ptg-cli -- --help
-cargo run -p ptg-cli -- --dry-run          # offline wiring check
-cargo run -p ptg-cli -- --vllm-url http://localhost:8000   # needs a live vLLM server (§7.1)
+cargo run -p ptg-cli -- --dry-run               # offline wiring check
+cargo run -p ptg-cli -- --probe --vllm-url http://127.0.0.1:18135 --model gemma-4-e4b
+                                                 # reachability + model listing
+cargo run -p ptg-cli -- --vllm-url http://127.0.0.1:18135 --model gemma-4-e4b --ticks 2
+                                                 # live text epoch (needs a server)
+cargo run -p ptg-cli -- --image-url https://example.com/img.png --input "describe"  # multimodal
 ```
+
+Validated live against a local `llama.cpp` `llama-server` (`gemma-4-e4b`):
+2-tick text epoch converged in 1 tick, mean confidence 0.94, all four columns
+passed strict per-sphere schema validation. Multimodal request serialization
+is unit-tested but not live-validated (the running server is text-only).

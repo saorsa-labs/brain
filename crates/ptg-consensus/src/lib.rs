@@ -23,6 +23,9 @@ pub struct ConvergenceCriteria {
     pub max_confidence_delta: f32,
     /// Stop once cosine similarity of successive confidence vectors reaches this.
     pub min_cosine_similarity: f32,
+    /// Columns with final confidence below this are excluded from the integrated
+    /// global percept (§6 Phase 3).
+    pub min_integration_confidence: f32,
 }
 
 impl Default for ConvergenceCriteria {
@@ -32,6 +35,7 @@ impl Default for ConvergenceCriteria {
             min_mean_confidence: 0.8,
             max_confidence_delta: 0.02,
             min_cosine_similarity: 0.999,
+            min_integration_confidence: 0.5,
         }
     }
 }

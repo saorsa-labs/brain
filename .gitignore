@@ -9,3 +9,7 @@
 .vscode/
 .idea/
 *.swp
+
+# Subagent review/work artifacts (local-only)
+phase2-review/
+phase2-work/

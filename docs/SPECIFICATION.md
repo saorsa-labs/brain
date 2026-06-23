@@ -521,7 +521,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-> **Note:** The snippets in §8 are the *reference* blueprint preserved verbatim from the original design. The shipped implementation in `crates/` refines them for production (panic-free error handling, a schema that parses all four spheres, the `history_buffer`, typed HTTP responses, and metric-based convergence). Differences are documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+> **Note:** The snippets in §8 are the *reference* blueprint preserved verbatim from the original design. The shipped implementation in `crates/` refines them for production: panic-free error handling; a schema that parses all four spheres; the `history_buffer`; typed HTTP responses; metric-based convergence; **a `Stimulus`-based `execute_column_tick` signature (text-as-string, multimodal-as-array)** for §2.3 multi-modality; per-sphere `validate_for_sphere`; confidence-aware `accepted`/`rejected_outputs`; and a `--probe` reachability check. Differences are documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
 ---
 

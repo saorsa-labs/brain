@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ptg_core::{ColumnOutputSchema, CorticalColumn, SchemaError};
+use ptg_core::{ColumnOutputSchema, CorticalColumn, SchemaError, Stimulus, StimulusPart};
 use serde::{Deserialize, Serialize};
 
 /// Errors surfaced by the inference engine layer.
@@ -46,32 +46,111 @@ pub trait ColumnEngine: Send + Sync {
     /// - [`EngineError::Http`] if the request to the engine fails.
     /// - [`EngineError::Json`] if the response or content is malformed.
     /// - [`EngineError::MissingContent`] if no message content is returned.
-    /// - [`EngineError::Validation`] if the structured output is invalid.
+    /// - [`EngineError::Validation`] if the structured output fails common or
+    ///   per-sphere schema validation.
     async fn execute_column_tick(
         &self,
         column: &CorticalColumn,
-        input_data: &str,
+        stimulus: &Stimulus,
         lateral_context: &str,
     ) -> Result<ColumnOutputSchema, EngineError>;
 }
 
+/// Probe a server's `/v1/models` endpoint.
+///
+/// # Errors
+/// [`EngineError::Http`] if the request fails or the server is unreachable.
+/// [`EngineError::Json`] if the response body is not a valid models listing.
+pub async fn list_models(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<String>, EngineError> {
+    let endpoint = format!("{base_url}/v1/models");
+    let response = client.get(endpoint).send().await?.error_for_status()?;
+    let body: serde_json::Value = response.json().await?;
+    parse_models_body(&body)
+}
+
+/// Parse an OpenAI-compatible `{ "data": [{ "id": "..." }, ...] }` models body.
+/// Separated from [`list_models`] so it can be unit-tested without a server.
+///
+/// # Errors
+/// [`EngineError::Json`] if the body does not deserialize into [`ModelsResponse`].
+fn parse_models_body(body: &serde_json::Value) -> Result<Vec<String>, EngineError> {
+    let parsed: ModelsResponse = serde_json::from_value(body.clone())?;
+    Ok(parsed.data.into_iter().map(|m| m.id).collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
 // ---------------------------------------------------------------------------
-// OpenAI-style chat completion wire types (§8.3)
+// OpenAI-style chat completion wire types (§8.3, multimodal §2.3)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: Vec<ChatRequestMessage<'a>>,
+    messages: Vec<ChatRequestMessage>,
     temperature: f32,
     max_tokens: u32,
     response_format: ResponseFormat,
 }
 
+/// A message's `content`: a plain string for text, or a typed-part array for
+/// multimodal inputs (OpenAI chat-completions content schema).
 #[derive(Debug, Serialize)]
-struct ChatRequestMessage<'a> {
-    role: &'a str,
-    content: String,
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// One element of a multimodal content array. The text part is always first; the
+/// image/audio parts are forwarded from the [`Stimulus`] verbatim (they already
+/// serialize to the OpenAI `type`/`image_url`/`input_audio` shapes via
+/// `ptg_core::StimulusPart`).
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart {
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: ptg_core::ImageUrlRef,
+    },
+    InputAudio {
+        input_audio: ptg_core::InputAudioRef,
+    },
+}
+
+impl ContentPart {
+    /// Forward a `ptg_core::StimulusPart` into the wire `ContentPart`, preserving
+    /// the OpenAI shapes.
+    #[must_use]
+    fn from_stimulus(part: &StimulusPart) -> Self {
+        match part {
+            StimulusPart::ImageUrl { image_url } => Self::ImageUrl {
+                image_url: image_url.clone(),
+            },
+            StimulusPart::InputAudio { input_audio } => Self::InputAudio {
+                input_audio: input_audio.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRequestMessage {
+    role: &'static str,
+    content: ChatContent,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,23 +216,41 @@ impl InferenceEngine {
             url: url.to_string(),
             model: model.to_string(),
             temperature: 0.2,
-            max_tokens: 400,
+            max_tokens: 512,
             pool_max_idle_per_host: 500,
             timeout: Duration::from_secs(120),
         }
     }
 
+    /// Borrow the shared HTTP client (e.g. for `--probe` / `list_models`).
+    #[must_use]
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// The configured engine base URL.
+    #[must_use]
+    pub fn vllm_url(&self) -> &str {
+        &self.vllm_url
+    }
+
     /// Build the composite prompt exactly as specified in §8.3.
-    fn compose_prompt(column: &CorticalColumn, input_data: &str, lateral_context: &str) -> String {
+    fn compose_prompt(
+        column: &CorticalColumn,
+        stimulus: &Stimulus,
+        lateral_context: &str,
+    ) -> String {
         format!(
             "{system}\n\nINPUT DATA TO PARSE:\n{input}\n\nLATERAL CONNECTIONS (NEIGHBOR SUGGESTIONS):\n{lateral}",
             system = column.system_prompt,
-            input = input_data,
+            input = stimulus.text_str(),
             lateral = lateral_context,
         )
     }
 
-    /// Parse the engine's returned content string into a validated schema.
+    /// Parse the engine's returned content string into a schema that passes the
+    /// common (cross-sphere) validation. Sphere-specific validation is performed
+    /// by the caller via [`ColumnOutputSchema::validate_for_sphere`].
     ///
     /// Exposed for unit testing without a live server. Tolerates minor
     /// conversational filler by extracting the outermost JSON object.
@@ -162,6 +259,22 @@ impl InferenceEngine {
         let schema: ColumnOutputSchema = serde_json::from_str(payload)?;
         schema.validate()?;
         Ok(schema)
+    }
+
+    /// Build the chat message content for a stimulus: a plain string for text,
+    /// or a typed-part array for multimodal inputs (text part first).
+    fn build_content(full_prompt: String, stimulus: &Stimulus) -> ChatContent {
+        match stimulus {
+            Stimulus::Text(_) => ChatContent::Text(full_prompt),
+            Stimulus::Multimodal { parts, .. } => {
+                let mut content_parts = Vec::with_capacity(parts.len() + 1);
+                content_parts.push(ContentPart::Text { text: full_prompt });
+                for p in parts {
+                    content_parts.push(ContentPart::from_stimulus(p));
+                }
+                ChatContent::Parts(content_parts)
+            }
+        }
     }
 }
 
@@ -228,15 +341,16 @@ impl ColumnEngine for InferenceEngine {
     async fn execute_column_tick(
         &self,
         column: &CorticalColumn,
-        input_data: &str,
+        stimulus: &Stimulus,
         lateral_context: &str,
     ) -> Result<ColumnOutputSchema, EngineError> {
-        let prompt = Self::compose_prompt(column, input_data, lateral_context);
+        let prompt = Self::compose_prompt(column, stimulus, lateral_context);
+        let content = Self::build_content(prompt, stimulus);
         let request = ChatRequest {
             model: &self.model,
             messages: vec![ChatRequestMessage {
                 role: "user",
-                content: prompt,
+                content,
             }],
             temperature: self.temperature,
             max_tokens: self.max_tokens,
@@ -253,14 +367,18 @@ impl ColumnEngine for InferenceEngine {
             .error_for_status()?;
         let parsed: ChatCompletionResponse = response.json().await?;
 
-        let content = parsed
+        let raw = parsed
             .choices
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
             .ok_or(EngineError::MissingContent)?;
 
-        Self::parse_output(&content)
+        let output = Self::parse_output(&raw)?;
+        // Enforce the column's sphere-specific schema (Item B). A small model
+        // that omits a required field surfaces as EngineError::Validation.
+        output.validate_for_sphere(column.sphere)?;
+        Ok(output)
     }
 }
 
@@ -292,7 +410,7 @@ mod tests {
     #[test]
     fn compose_prompt_contains_sections() {
         let col = CorticalColumn::with_defaults("CC_X", DomainSphere::Physics);
-        let prompt = InferenceEngine::compose_prompt(&col, "INPUT", "LATERAL");
+        let prompt = InferenceEngine::compose_prompt(&col, &Stimulus::text("INPUT"), "LATERAL");
         assert!(prompt.contains("INPUT DATA TO PARSE:"));
         assert!(prompt.contains("LATERAL CONNECTIONS"));
         assert!(prompt.contains("INPUT"));
@@ -315,8 +433,78 @@ mod tests {
     }
 
     #[test]
+    fn build_content_text_uses_plain_string() -> Result<(), Box<dyn std::error::Error>> {
+        let content = InferenceEngine::build_content("hello".into(), &Stimulus::text("hi"));
+        let json = serde_json::to_string(&content)?;
+        assert_eq!(json, "\"hello\"");
+        Ok(())
+    }
+
+    #[test]
+    fn build_content_multimodal_uses_part_array() -> Result<(), Box<dyn std::error::Error>> {
+        use ptg_core::{AudioFormat, ImageDetail, ImageUrlRef, InputAudioRef};
+        let stimulus = Stimulus::Multimodal {
+            text: "caption".into(),
+            parts: vec![
+                StimulusPart::ImageUrl {
+                    image_url: ImageUrlRef {
+                        url: "data:image/png;base64,AAAA".into(),
+                        detail: ImageDetail::High,
+                    },
+                },
+                StimulusPart::InputAudio {
+                    input_audio: InputAudioRef {
+                        // OpenAI `input_audio.data` is raw base64; the field is
+                        // forwarded verbatim, so callers must NOT use a data URI.
+                        data: "Bg==".into(),
+                        format: AudioFormat::Wav,
+                    },
+                },
+            ],
+        };
+        let content = InferenceEngine::build_content("full prompt".into(), &stimulus);
+        let json = serde_json::to_string(&content)?;
+        assert!(
+            json.starts_with('['),
+            "multimodal content must be an array: {json}"
+        );
+        assert!(
+            json.contains(r#""type":"text","text":"full prompt""#),
+            "text part missing: {json}"
+        );
+        assert!(
+            json.contains(r#""type":"image_url""#),
+            "image part missing: {json}"
+        );
+        assert!(
+            json.contains(r#""type":"input_audio""#),
+            "audio part missing: {json}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn extract_json_block_handles_nested() {
         let content = r#"noise {"a": {"b": 1}, "c": 2} tail"#;
         assert_eq!(extract_json_block(content), r#"{"a": {"b": 1}, "c": 2}"#);
+    }
+
+    #[test]
+    fn parse_models_body_extracts_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{ "data": [{ "id": "gemma-4-e4b" }, { "id": "other" }] }"#)?;
+        let ids = parse_models_body(&body)?;
+        assert_eq!(ids, vec!["gemma-4-e4b".to_string(), "other".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_models_body_rejects_bad_shape() {
+        // missing 'data' field
+        assert!(parse_models_body(&serde_json::json!({ "oops": [] })).is_err());
+        // 'data' present but an entry lacks required 'id'
+        assert!(parse_models_body(&serde_json::json!({ "data": [{ "not_id": "x" }] })).is_err());
+        // well-formed empty listing is fine
+        assert!(parse_models_body(&serde_json::json!({ "data": [] })).is_ok_and(|v| v.is_empty()));
     }
 }
