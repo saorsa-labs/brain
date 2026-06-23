@@ -45,9 +45,23 @@ PTG is built incrementally against the [specification](./SPECIFICATION.md) and
       verbatim output printing are documented to revisit before exposing the
       CLI to untrusted input.
 
-## Phase 3 — Topologies & convergence depth (next)
+## Benchmark — Mesh vs monolithic baseline (in progress)
 
-## Phase 3 — Topologies & convergence depth
+Ground the thesis: is the cortical *mechanism* better than a single-monolithic
+context (and a compute-matched ensemble) for latency, token economy, and answer
+quality? Methodology is committed in [`docs/BENCHMARKING.md`](./BENCHMARKING.md);
+pilot first (5 prompts × 3 repeats), scale to ~50+ only if the harness and
+compute-matched controls pass review. No headline quality claim until then.
+
+- [ ] Committed methodology doc + fair-baseline design (C1–C4 confounds neutralized).
+- [ ] Instrument the engine for per-call `usage` (incl. `cached_tokens`) +
+      `finish_reason`, without changing the `ColumnEngine` trait.
+- [ ] `ptg-bench` harness: `mesh_adaptive` / `mono_all_prompts` / `mono_x4`;
+      JSONL raw records + Markdown summary.
+- [ ] Pilot run against `gemma-4-e4b`; record results (pilot-only, no headline).
+- [ ] Scale to ~50+ prompts + paired statistics if pilot is sound.
+
+## Phase 3 — Topologies & convergence depth (next)
 
 - [ ] Pluggable topologies: ring, torus, small-world (§3.1.3).
 - [ ] Weighted / attention-routed lateral connections (§9.1 "Dynamic Topology

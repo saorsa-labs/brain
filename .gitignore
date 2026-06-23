@@ -13,3 +13,6 @@
 # Subagent review/work artifacts (local-only)
 phase2-review/
 phase2-work/
+
+# Benchmark run output (large, regenerated)
+bench-runs/
