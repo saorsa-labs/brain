@@ -244,7 +244,13 @@ impl ColumnEngine for InferenceEngine {
         };
 
         let endpoint = format!("{}/v1/chat/completions", self.vllm_url);
-        let response = self.client.post(endpoint).json(&request).send().await?;
+        let response = self
+            .client
+            .post(endpoint)
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
         let parsed: ChatCompletionResponse = response.json().await?;
 
         let content = parsed

@@ -50,4 +50,5 @@ PTG is built incrementally against the [specification](./SPECIFICATION.md) and
 - [ ] Benchmarks: latency, token economy vs. single-monolithic-context
       baseline, convergence quality.
 - [ ] Per-round tracing of predictions and confidence for debugging emergence.
-- [ ] `dashmap`-backed column store for high-contention scale (dep reserved).
+- [ ] `dashmap`-backed column store for high-contention scale (dependency to
+      be added when used).
