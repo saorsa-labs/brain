@@ -10,7 +10,8 @@
 //! `mistral.rs`, or any other server can be swapped in without touching the
 //! runtime.
 
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ptg_core::{ColumnOutputSchema, CorticalColumn, SchemaError, Stimulus, StimulusPart};
@@ -31,6 +32,90 @@ pub enum EngineError {
     /// The structured output failed schema validation.
     #[error("structured output failed validation: {0}")]
     Validation(#[from] SchemaError),
+}
+
+// ---------------------------------------------------------------------------
+// Per-call metrics (benchmarking — see `docs/BENCHMARKING.md`)
+// ---------------------------------------------------------------------------
+
+/// Per-call metrics captured for every inference call. Mirrors the OpenAI
+/// `usage` block (including `prompt_tokens_details.cached_tokens`), the choice's
+/// `finish_reason`, and the wall-clock latency of the HTTP call.
+///
+/// Recorded via an optional [`MetricsSink`] attached to the engine, so a
+/// benchmark can collect all calls between method start/end without changing
+/// the [`ColumnEngine`] trait.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EngineCallMetrics {
+    /// Epoch milliseconds at which the call completed.
+    pub completed_at_ms: u64,
+    /// Wall-clock latency of the HTTP call, in milliseconds.
+    pub latency_ms: u64,
+    /// Model id used for the call.
+    pub model: String,
+    /// `finish_reason` of the first choice, if reported (`"stop"`, `"length"`...).
+    pub finish_reason: Option<String>,
+    /// `usage.prompt_tokens`.
+    pub prompt_tokens: Option<u32>,
+    /// `usage.completion_tokens`.
+    pub completion_tokens: Option<u32>,
+    /// `usage.total_tokens`.
+    pub total_tokens: Option<u32>,
+    /// `usage.prompt_tokens_details.cached_tokens` (prefix-cache hits).
+    pub cached_tokens: Option<u32>,
+    /// Column id when the call originated from a column tick; `None` for ad-hoc
+    /// calls (e.g. the monolithic baseline).
+    pub column_id: Option<String>,
+}
+
+/// A sink that records [`EngineCallMetrics`] for every inference call. Stored
+/// on the engine behind an `Option<Arc<dyn MetricsSink>>`; the default is `None`
+/// (no overhead when benchmarking is inactive).
+pub trait MetricsSink: Send + Sync {
+    /// Record one call's metrics.
+    fn record(&self, metrics: EngineCallMetrics);
+}
+
+/// A simple collecting sink: appends every record into a shared, lock-protected
+/// vector. A benchmark drains it between runs to attribute records to a single
+/// generator invocation.
+#[derive(Debug, Default)]
+pub struct CollectorSink {
+    records: Mutex<Vec<EngineCallMetrics>>,
+}
+
+impl CollectorSink {
+    /// Create an empty collector.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remove and return all records collected so far.
+    pub fn drain(&self) -> Vec<EngineCallMetrics> {
+        let mut guard = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    }
+
+    /// Number of records currently held.
+    pub fn len(&self) -> usize {
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether the collector currently holds no records.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl MetricsSink for CollectorSink {
+    fn record(&self, metrics: EngineCallMetrics) {
+        let mut guard = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.push(metrics);
+    }
 }
 
 /// Contract for a column's inference backend.
@@ -102,6 +187,10 @@ struct ChatRequest<'a> {
     temperature: f32,
     max_tokens: u32,
     response_format: ResponseFormat,
+    /// Optional sampling seed for reproducibility (`docs/BENCHMARKING.md`).
+    /// Omitted from the wire body when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
 }
 
 /// A message's `content`: a plain string for text, or a typed-part array for
@@ -168,11 +257,51 @@ impl ResponseFormat {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Usage,
+}
+
+impl ChatCompletionResponse {
+    /// `finish_reason` of the first choice, if reported.
+    fn first_finish_reason(&self) -> Option<String> {
+        self.choices.first().and_then(|c| c.finish_reason.clone())
+    }
+}
+
+/// OpenAI-style `usage` block. All fields optional: older/trimmed responses may
+/// omit usage entirely, and servers need not populate every field.
+#[derive(Debug, Default, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl Usage {
+    /// Cached prompt tokens reported under `prompt_tokens_details.cached_tokens`.
+    fn cached_tokens(&self) -> Option<u32> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +324,8 @@ pub struct InferenceEngine {
     model: String,
     temperature: f32,
     max_tokens: u32,
+    seed: Option<u64>,
+    metrics_sink: Option<Arc<dyn MetricsSink>>,
 }
 
 impl InferenceEngine {
@@ -219,6 +350,8 @@ impl InferenceEngine {
             max_tokens: 512,
             pool_max_idle_per_host: 500,
             timeout: Duration::from_secs(120),
+            seed: None,
+            metrics_sink: None,
         }
     }
 
@@ -232,6 +365,81 @@ impl InferenceEngine {
     #[must_use]
     pub fn vllm_url(&self) -> &str {
         &self.vllm_url
+    }
+
+    /// Run a single ad-hoc chat completion (one user message) through the same
+    /// instrumented path as column ticks, so its per-call `usage` is captured by
+    /// the same metrics sink. Used by benchmark generators that are not column
+    /// ticks (e.g. the single-monolithic-context baseline; see
+    /// `docs/BENCHMARKING.md`). Returns the raw message content and the metrics.
+    ///
+    /// # Errors
+    /// [`EngineError::Http`] / [`EngineError::Json`] / [`EngineError::MissingContent`].
+    pub async fn complete(&self, prompt: &str) -> Result<(String, EngineCallMetrics), EngineError> {
+        let messages = vec![ChatRequestMessage {
+            role: "user",
+            content: ChatContent::Text(prompt.to_string()),
+        }];
+        self.chat_completion(messages, None).await
+    }
+
+    /// The single instrumented HTTP path used by both column ticks and ad-hoc
+    /// [`InferenceEngine::complete`] calls: sends the request, parses the
+    /// OpenAI-style response, records per-call metrics to the attached sink (if
+    /// any), and returns the raw message content plus the metrics record.
+    ///
+    /// `column_id` only tags the metrics record; it does not change the request.
+    async fn chat_completion(
+        &self,
+        messages: Vec<ChatRequestMessage>,
+        column_id: Option<&str>,
+    ) -> Result<(String, EngineCallMetrics), EngineError> {
+        let request = ChatRequest {
+            model: &self.model,
+            messages,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            response_format: ResponseFormat::JSON_OBJECT,
+            seed: self.seed,
+        };
+        let endpoint = format!("{}/v1/chat/completions", self.vllm_url);
+        let start = Instant::now();
+        let response = self
+            .client
+            .post(endpoint)
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+        let parsed: ChatCompletionResponse = response.json().await?;
+        let latency = start.elapsed();
+
+        let finish_reason = parsed.first_finish_reason();
+        let metrics = EngineCallMetrics {
+            completed_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            latency_ms: latency.as_millis() as u64,
+            model: self.model.clone(),
+            finish_reason,
+            prompt_tokens: parsed.usage.prompt_tokens,
+            completion_tokens: parsed.usage.completion_tokens,
+            total_tokens: parsed.usage.total_tokens,
+            cached_tokens: parsed.usage.cached_tokens(),
+            column_id: column_id.map(str::to_owned),
+        };
+        if let Some(sink) = &self.metrics_sink {
+            sink.record(metrics.clone());
+        }
+
+        let raw = parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .ok_or(EngineError::MissingContent)?;
+        Ok((raw, metrics))
     }
 
     /// Build the composite prompt exactly as specified in §8.3.
@@ -286,6 +494,8 @@ pub struct EngineBuilder {
     max_tokens: u32,
     pool_max_idle_per_host: usize,
     timeout: Duration,
+    seed: Option<u64>,
+    metrics_sink: Option<Arc<dyn MetricsSink>>,
 }
 
 impl EngineBuilder {
@@ -317,6 +527,23 @@ impl EngineBuilder {
         self
     }
 
+    /// Set a fixed sampling seed for reproducibility (default none / server
+    /// default). The benchmark pins this to neutralize run-to-run variance
+    /// (`docs/BENCHMARKING.md`).
+    #[must_use]
+    pub const fn seed(mut self, seed: Option<u64>) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// Attach a metrics sink that records per-call usage, `finish_reason`, and
+    /// latency for benchmarking/observability (default none).
+    #[must_use]
+    pub fn metrics_sink(mut self, sink: Arc<dyn MetricsSink>) -> Self {
+        self.metrics_sink = Some(sink);
+        self
+    }
+
     /// Finalize the engine.
     ///
     /// # Errors
@@ -332,6 +559,8 @@ impl EngineBuilder {
             model: self.model,
             temperature: self.temperature,
             max_tokens: self.max_tokens,
+            seed: self.seed,
+            metrics_sink: self.metrics_sink,
         })
     }
 }
@@ -346,33 +575,11 @@ impl ColumnEngine for InferenceEngine {
     ) -> Result<ColumnOutputSchema, EngineError> {
         let prompt = Self::compose_prompt(column, stimulus, lateral_context);
         let content = Self::build_content(prompt, stimulus);
-        let request = ChatRequest {
-            model: &self.model,
-            messages: vec![ChatRequestMessage {
-                role: "user",
-                content,
-            }],
-            temperature: self.temperature,
-            max_tokens: self.max_tokens,
-            response_format: ResponseFormat::JSON_OBJECT,
-        };
-
-        let endpoint = format!("{}/v1/chat/completions", self.vllm_url);
-        let response = self
-            .client
-            .post(endpoint)
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?;
-        let parsed: ChatCompletionResponse = response.json().await?;
-
-        let raw = parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .ok_or(EngineError::MissingContent)?;
+        let messages = vec![ChatRequestMessage {
+            role: "user",
+            content,
+        }];
+        let (raw, _metrics) = self.chat_completion(messages, Some(&column.id)).await?;
 
         let output = Self::parse_output(&raw)?;
         // Enforce the column's sphere-specific schema (Item B). A small model
@@ -506,5 +713,55 @@ mod tests {
         assert!(parse_models_body(&serde_json::json!({ "data": [{ "not_id": "x" }] })).is_err());
         // well-formed empty listing is fine
         assert!(parse_models_body(&serde_json::json!({ "data": [] })).is_ok_and(|v| v.is_empty()));
+    }
+
+    #[test]
+    fn parses_usage_and_cached_tokens() -> Result<(), Box<dyn std::error::Error>> {
+        // Realistic llama-server response shape (matches a live probe).
+        let body = r#"{
+            "choices":[{"message":{"content":"{\"prediction\":\"p\",\"reference_frame_coordinates\":\"c\",\"confidence\":0.5}"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":16,"completion_tokens":2,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":1}}
+        }"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body)?;
+        assert_eq!(parsed.usage.prompt_tokens, Some(16));
+        assert_eq!(parsed.usage.completion_tokens, Some(2));
+        assert_eq!(parsed.usage.total_tokens, Some(18));
+        assert_eq!(parsed.usage.cached_tokens(), Some(1));
+        assert_eq!(parsed.first_finish_reason().as_deref(), Some("stop"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_response_without_usage() -> Result<(), Box<dyn std::error::Error>> {
+        // Older/trimmed responses without usage must still parse (serde default).
+        let body = r#"{"choices":[{"message":{"content":"{}"}}]}"#;
+        let parsed: ChatCompletionResponse = serde_json::from_str(body)?;
+        assert_eq!(parsed.usage.prompt_tokens, None);
+        assert_eq!(parsed.usage.cached_tokens(), None);
+        assert_eq!(parsed.first_finish_reason(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn collector_sink_records_and_drains() {
+        let sink = Arc::new(CollectorSink::new());
+        sink.record(EngineCallMetrics {
+            prompt_tokens: Some(16),
+            cached_tokens: Some(1),
+            column_id: Some("CC_X".into()),
+            ..Default::default()
+        });
+        sink.record(EngineCallMetrics {
+            prompt_tokens: Some(7),
+            ..Default::default()
+        });
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].prompt_tokens, Some(16));
+        assert_eq!(drained[0].cached_tokens, Some(1));
+        assert_eq!(drained[0].column_id.as_deref(), Some("CC_X"));
+        // draining empties the sink
+        assert!(sink.is_empty());
+        assert!(sink.drain().is_empty());
     }
 }

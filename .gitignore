@@ -16,3 +16,4 @@ phase2-work/
 
 # Benchmark run output (large, regenerated)
 bench-runs/
+agent/
