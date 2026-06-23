@@ -69,4 +69,4 @@ This repository currently contains the **architecture scaffold** for PTG: a comp
 
 ## License
 
-Dual **AGPL-3.0 / Commercial** © Saorsa Labs. (`AGPL-3.0-or-later` SPDX in manifests; alternative commercial licensing available on request — david@saorsalabs.com)
+AGPL-3.0-or-later © Saorsa Labs. Commercial licensing is available by separate agreement: david@saorsalabs.com.
