@@ -2,7 +2,7 @@
 
 > A distributed, prompt-based **cortical mesh simulator** written in Rust — implementing the organizational principles of Jeff Hawkins' *Thousand Brains Theory of Intelligence* as a multi-agent system.
 
-[![status](https://img.shields.io/badge/status-architecture%20scaffold-orange)](docs/ROADMAP.md)
+[![status](https://img.shields.io/badge/status-v1%20execution%20skeleton-brightgreen)](docs/ROADMAP.md)
 [![license](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange)](#getting-started)
 
@@ -40,11 +40,11 @@ By leveraging unified memory architectures on modern high-end developer workstat
 ```
 brain/
 ├── crates/
-│   ├── ptg-core        # Domain types: columns, reference frames, topology, outputs
-│   ├── ptg-vllm        # Shared local inference engine ("thalamus") client
-│   ├── ptg-consensus   # Multi-round voting, convergence criteria
-│   ├── ptg-runtime     # Mesh orchestration: fan-out + lateral injection + consensus
-│   └── ptg-cli         # Command-line entry point
+│   ├── ptg-core        # CorticalColumn, DomainSphere, ColumnOutputSchema, HistoryBuffer, PROMPT_*
+│   ├── ptg-vllm        # Shared inference engine ("thalamus"): ColumnEngine trait + reqwest InferenceEngine
+│   ├── ptg-consensus   # Convergence math (mean/delta/cosine over confidence vectors, ndarray)
+│   ├── ptg-runtime     # CorticalMesh: 3-phase epoch loop (fan-out + lateral injection + integration)
+│   └── ptg-cli         # `ptg` binary (clap + tracing, --dry-run)
 └── docs/               # Specification, architecture, roadmap
 ```
 
@@ -59,7 +59,15 @@ cargo run -p ptg-cli
 
 ## Status
 
-This repository currently contains the **architecture scaffold** for PTG: a compiling Rust workspace encoding the core domain model and crate boundaries defined in the specification. Implementation of the inference fan-out, lateral token injection, and consensus engine is tracked in the [roadmap](docs/ROADMAP.md).
+The **V1 execution skeleton** is implemented and panic-free: a compiling Rust
+workspace encoding the domain model, a shared `InferenceEngine` client, the
+three-phase epoch loop with lateral context injection, metric-based convergence,
+and a `ptg` CLI (with `--dry-run` for offline validation). It is unit-tested
+with a mock engine — no live vLLM server is required to build or test. Running
+real inference needs a local vLLM server (see [§7.1](docs/SPECIFICATION.md)).
+
+Next phases — weighted/attention routing, full semantic convergence, true
+multimodality, and benchmarks — are tracked in the [roadmap](docs/ROADMAP.md).
 
 ## Documentation
 

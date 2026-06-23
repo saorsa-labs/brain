@@ -11,3 +11,10 @@ description = "Cortical mesh orchestration runtime for PTG."
 ptg-core = { path = "../ptg-core" }
 ptg-vllm = { path = "../ptg-vllm" }
 ptg-consensus = { path = "../ptg-consensus" }
+ndarray = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }

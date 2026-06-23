@@ -1,124 +1,312 @@
 //! Core domain types for Project Thousand-Gemma (PTG).
 //!
-//! These types model the building blocks of the distributed, prompt-based
-//! cortical mesh described in the architectural specification: virtual
-//! cortical columns, their reference frames, their outputs, and the
-//! topology of lateral connections between them.
+//! Models the virtual cortical column (§3.1.2), the structured output schema
+//! every column emits (§5), the domain spheres and their immutable system
+//! prompts (§5), and the fixed-capacity history buffer each column maintains
+//! to respect its strict per-column memory budget (§3.1.2 / §7.2).
+
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-/// Identifier for a single virtual cortical column within the mesh.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ColumnId(pub u64);
+// ---------------------------------------------------------------------------
+// System prompts (§5 "Column Prompt Blueprint")
+// ---------------------------------------------------------------------------
 
-impl ColumnId {
-    /// Create a new column identifier.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
+/// Physics reference-frame prompt (§5).
+pub const PROMPT_PHYSICS: &str = r#"
+ROLE: Cortical Column - Primary Physics Sensor.
+CONTEXT COMPARTMENTALIZATION: You parse all incoming inputs strictly through the laws of classical mechanics, thermodynamics, kinetics, electromagnetism, and quantum principles. Ignore emotional intent, language syntax, or historical origin.
+REFERENCE FRAME: Map the input data to a spatial reference frame consisting of forces (vectors), energy fields (Joules), masses (kg), and thermodynamic gradients.
+OUTPUT FORMAT: You must output a structured JSON schema conforming exactly to:
+{
+  "reference_frame_coordinates": "x,y,z spatial/conceptual bounds",
+  "isolated_variables": ["var1", "var2"],
+  "empirical_observation": "Brief summary of input through physical laws",
+  "prediction": "What the system will do next based on physical mechanics",
+  "confidence": 0.00
 }
+Do not include any conversational filler outside the JSON block.
+"#;
 
-impl std::fmt::Display for ColumnId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "col-{}", self.0)
-    }
+/// Mathematics reference-frame prompt (§5).
+pub const PROMPT_MATHEMATICS: &str = r#"
+ROLE: Cortical Column - Quantitative Reasoning Engine.
+CONTEXT COMPARTMENTALIZATION: You analyze inputs strictly for mathematical constants, geometric structures, algorithmic complexity, numerical relationships, and formal logic. Ignore material composition, time period, and human bias.
+REFERENCE FRAME: Establish an algebraic, geometric, or statistical coordinate structure.
+OUTPUT FORMAT: Output a structured JSON schema:
+{
+  "reference_frame_coordinates": "matrix or tensor spatial bounds",
+  "axiomatic_assertions": ["assertion1", "assertion2"],
+  "deductive_synthesis": "Brief formal proof or numerical analysis",
+  "prediction": "Extrapolated quantitative trend line",
+  "confidence": 0.00
 }
+"#;
 
-/// The sensory / cognitive modality a column is specialized for.
-///
-/// Mirrors the multi-modal columns referenced in the Thousand Brains mapping
-/// (visual, tactile, abstract-mathematical, ...).
+/// Coding reference-frame prompt (§5).
+pub const PROMPT_CODING: &str = r#"
+ROLE: Cortical Column - Algorithmic Synthesis Unit.
+CONTEXT COMPARTMENTALIZATION: Interpret incoming information as software systems, computational logic, control flows, state machines, data structures, and algorithmic transformations.
+REFERENCE FRAME: Map data to a computational graph or state transition matrix.
+OUTPUT FORMAT: Output a structured JSON schema:
+{
+  "reference_frame_coordinates": "state_machine_id / memory_offset",
+  "state_variables": ["param1", "param2"],
+  "algorithmic_analysis": "Logic evaluation, time complexity big-O, structure verification",
+  "prediction": "Deterministic outcome of execution flow",
+  "confidence": 0.00
+}
+"#;
+
+/// Psychology reference-frame prompt (§5).
+pub const PROMPT_PSYCHOLOGY: &str = r#"
+ROLE: Cortical Column - Behavioral / Intention Analyzer.
+CONTEXT COMPARTMENTALIZATION: Evaluate inputs purely for human psychological states, evolutionary drivers, cognitive biases, communicative intent, emotional dynamics, or behavioral patterns.
+REFERENCE FRAME: Map data to a psychological profile or sociometric matrix.
+OUTPUT FORMAT: Output a structured JSON schema:
+{
+  "reference_frame_coordinates": "emotional_valence / behavioral_vector",
+  "cognitive_biases": ["bias1", "bias2"],
+  "behavioral_synthesis": "Assessment of underlying motivation or intent",
+  "prediction": "Expected behavioral choice or adaptation profile",
+  "confidence": 0.00
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// Domain spheres (§5, §8.1)
+// ---------------------------------------------------------------------------
+
+/// Domain specialization of a cortical column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Modality {
-    /// Visual scene analysis.
-    Visual,
-    /// Tactile / somatosensory signals.
-    Tactile,
-    /// Auditory signals.
-    Auditory,
-    /// Abstract symbolic reasoning (e.g. mathematics, logic).
-    Abstract,
-    /// Proprioceptive / positional signals.
-    Proprioceptive,
+pub enum DomainSphere {
+    Physics,
+    Mathematics,
+    Coding,
+    Psychology,
 }
 
-/// A localized coordinate map that constrains a column's perception to a
-/// specific spatial or conceptual region.
-///
-/// In PTG a reference frame is realized as forced structural JSON that bounds
-/// the column's output space, so arbitrary spatial / conceptual axes can be
-/// expressed without code changes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReferenceFrame {
-    /// Stable identifier for the frame (e.g. `"left-visual-field"`).
-    pub id: String,
-    /// Human-readable description of what the frame covers.
-    pub description: String,
-    /// Structured schema bounding the frame's coordinate space.
-    pub schema: serde_json::Value,
+impl DomainSphere {
+    /// Human-readable sphere name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Physics => "Physics",
+            Self::Mathematics => "Mathematics",
+            Self::Coding => "Coding",
+            Self::Psychology => "Psychology",
+        }
+    }
+
+    /// The immutable base system prompt that restricts this column to its
+    /// reference frame (§5).
+    #[must_use]
+    pub const fn default_prompt(self) -> &'static str {
+        match self {
+            Self::Physics => PROMPT_PHYSICS,
+            Self::Mathematics => PROMPT_MATHEMATICS,
+            Self::Coding => PROMPT_CODING,
+            Self::Psychology => PROMPT_PSYCHOLOGY,
+        }
+    }
 }
 
-/// Hyper-targeted system prompt and configuration that turns a generic
-/// inference call into a specialized cortical column.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnSpec {
-    pub id: ColumnId,
-    pub modality: Modality,
-    pub reference_frame: ReferenceFrame,
-    /// The domain-specific system prompt enforcing this column's cognitive prism.
-    pub system_prompt: String,
-}
+// ---------------------------------------------------------------------------
+// History buffer (§3.1.2 history_buffer, §7.2 memory budget)
+// ---------------------------------------------------------------------------
 
-/// A single column's prediction about its slice of the world.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnOutput {
-    pub column: ColumnId,
-    /// The column's prediction / hypothesis, structurally formatted per its frame.
-    pub prediction: serde_json::Value,
-    /// Self-reported confidence in `[0.0, 1.0]`, used during lateral voting.
+/// One tick of a column's recorded history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryEntry {
+    pub tick: u32,
+    pub prediction: String,
     pub confidence: f32,
 }
 
-/// A token-bearing message passed along a lateral connection from one column
-/// to a neighbor, injecting structural context into the receiver.
+/// Fixed-capacity ring buffer retaining the last `capacity` ticks of column
+/// state, enforcing the strict per-column memory budget described in §7.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LateralMessage {
-    pub from: ColumnId,
-    pub to: ColumnId,
-    /// Serialized neighbor context injected into the receiver's prompt.
-    pub context: String,
-    /// Weight applied to this neighbor's vote.
-    pub weight: f32,
+pub struct HistoryBuffer {
+    capacity: usize,
+    entries: VecDeque<HistoryEntry>,
 }
 
-/// Edge list describing the mesh of lateral connections between columns.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Topology {
-    /// Directed weighted edges: `(from, to, weight)`.
-    pub edges: Vec<(ColumnId, ColumnId, f32)>,
-}
-
-impl Topology {
-    /// Create an empty topology.
+impl HistoryBuffer {
+    /// Create a new ring buffer that retains at most `capacity` entries.
+    ///
+    /// A `capacity` of `0` yields a buffer that discards everything pushed.
     #[must_use]
-    pub fn new() -> Self {
-        Self { edges: Vec::new() }
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::with_capacity(capacity),
+        }
     }
 
-    /// Connect `from` -> `to` with the given lateral weight.
-    pub fn connect(&mut self, from: ColumnId, to: ColumnId, weight: f32) {
-        self.edges.push((from, to, weight));
+    /// Record a new tick, dropping the oldest entry when at capacity.
+    pub fn push(&mut self, entry: HistoryEntry) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
     }
 
-    /// Return the columns that `column` listens to, paired with edge weight.
-    pub fn neighbors(&self, column: &ColumnId) -> Vec<(&ColumnId, f32)> {
-        self.edges
-            .iter()
-            .filter(|(_, to, _)| to == column)
-            .map(|(from, _, w)| (from, *w))
-            .collect()
+    /// Number of retained entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
+
+    /// Whether no entries are retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate over retained entries, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &HistoryEntry> {
+        self.entries.iter()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cortical column (§3.1.2, §8.1)
+// ---------------------------------------------------------------------------
+
+/// A single virtual cortical column: a thread-safe unit of cognition bound to
+/// one domain sphere and reference frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorticalColumn {
+    /// Unique identifier, e.g. `"CC_PHYSICS_01"`.
+    pub id: String,
+    /// Domain specialization.
+    pub sphere: DomainSphere,
+    /// Immutable base instruction set mapping inputs to a reference frame.
+    pub system_prompt: String,
+    /// Current conceptual/spatial coordinate in the problem space.
+    pub current_coordinate: String,
+    /// Internal prediction certainty in `[0.0, 1.0]`.
+    pub last_confidence: f32,
+    /// Most recent prediction string.
+    pub last_prediction: String,
+    /// Ring buffer of recent ticks (§3.1.2 / §7.2).
+    pub history_buffer: HistoryBuffer,
+}
+
+impl CorticalColumn {
+    /// Construct a new column with an explicit system prompt.
+    #[must_use]
+    pub fn new(id: &str, sphere: DomainSphere, prompt: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            sphere,
+            system_prompt: prompt.to_string(),
+            current_coordinate: String::from("0.0,0.0,0.0"),
+            last_confidence: 0.0,
+            last_prediction: String::new(),
+            history_buffer: HistoryBuffer::new(64),
+        }
+    }
+
+    /// Construct a new column using the default system prompt for its sphere.
+    #[must_use]
+    pub fn with_defaults(id: &str, sphere: DomainSphere) -> Self {
+        Self::new(id, sphere, sphere.default_prompt())
+    }
+
+    /// Apply one tick's structured output to the column's running state.
+    pub fn record_tick(&mut self, tick: u32, output: &ColumnOutputSchema) {
+        self.last_prediction = output.prediction.clone();
+        self.last_confidence = output.confidence;
+        self.current_coordinate = output.reference_frame_coordinates.clone();
+        self.history_buffer.push(HistoryEntry {
+            tick,
+            prediction: output.prediction.clone(),
+            confidence: output.confidence,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structured output schema (§5)
+// ---------------------------------------------------------------------------
+
+/// Errors raised when a column's structured output fails validation.
+#[derive(Debug, thiserror::Error)]
+pub enum SchemaError {
+    /// Confidence was NaN or infinite.
+    #[error("confidence is not a finite number")]
+    NonFiniteConfidence,
+    /// Confidence fell outside `[0.0, 1.0]`.
+    #[error("confidence {0} out of range [0.0, 1.0]")]
+    ConfidenceOutOfRange(f32),
+}
+
+/// The structured JSON every column emits.
+///
+/// Only the three fields common to all domain prompts (`reference_frame_coordinates`,
+/// `prediction`, `confidence`) are typed; the domain-specific fields (e.g.
+/// `isolated_variables`, `axiomatic_assertions`, `algorithmic_analysis`,
+/// `behavioral_synthesis`) are preserved verbatim in `domain_fields`. This makes
+/// the schema parse all four spheres (§5), unlike a struct that hard-codes a
+/// single sphere's field names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnOutputSchema {
+    pub reference_frame_coordinates: String,
+    pub prediction: String,
+    pub confidence: f32,
+    /// Domain-specific fields emitted by the column's prompt, keyed by name.
+    #[serde(default, flatten)]
+    pub domain_fields: BTreeMap<String, serde_json::Value>,
+}
+
+impl ColumnOutputSchema {
+    /// Validate the structured output: confidence must be finite and in range.
+    ///
+    /// # Errors
+    /// - [`SchemaError::NonFiniteConfidence`] if `confidence` is NaN/infinite.
+    /// - [`SchemaError::ConfidenceOutOfRange`] if `confidence` is outside
+    ///   `[0.0, 1.0]`.
+    pub fn validate(&self) -> Result<(), SchemaError> {
+        if !self.confidence.is_finite() {
+            return Err(SchemaError::NonFiniteConfidence);
+        }
+        if !(0.0..=1.0).contains(&self.confidence) {
+            return Err(SchemaError::ConfidenceOutOfRange(self.confidence));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default mesh wiring (§8.4)
+// ---------------------------------------------------------------------------
+
+/// The four default cortical columns from the reference wiring (§8.4).
+#[must_use]
+pub fn default_columns() -> Vec<CorticalColumn> {
+    vec![
+        CorticalColumn::with_defaults("CC_PHYSICS_01", DomainSphere::Physics),
+        CorticalColumn::with_defaults("CC_MATH_01", DomainSphere::Mathematics),
+        CorticalColumn::with_defaults("CC_CODE_01", DomainSphere::Coding),
+        CorticalColumn::with_defaults("CC_PSYCH_01", DomainSphere::Psychology),
+    ]
+}
+
+/// The default bidirectional lateral connections from the reference wiring (§8.4),
+/// as `(from_id, to_id)` pairs.
+#[must_use]
+pub fn default_connections() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("CC_PHYSICS_01", "CC_MATH_01"),
+        ("CC_MATH_01", "CC_PHYSICS_01"),
+        ("CC_MATH_01", "CC_CODE_01"),
+        ("CC_CODE_01", "CC_PSYCH_01"),
+    ]
 }
 
 #[cfg(test)]
@@ -126,16 +314,137 @@ mod tests {
     use super::*;
 
     #[test]
-    fn column_id_displays_stable_prefix() {
-        assert_eq!(ColumnId::new(7).to_string(), "col-7");
+    fn default_prompt_matches_sphere() {
+        assert_eq!(DomainSphere::Physics.default_prompt(), PROMPT_PHYSICS);
+        assert_eq!(
+            DomainSphere::Mathematics.default_prompt(),
+            PROMPT_MATHEMATICS
+        );
+        assert_eq!(DomainSphere::Coding.default_prompt(), PROMPT_CODING);
+        assert_eq!(DomainSphere::Psychology.default_prompt(), PROMPT_PSYCHOLOGY);
     }
 
     #[test]
-    fn topology_neighbors_respect_direction() {
-        let mut topo = Topology::new();
-        topo.connect(ColumnId::new(1), ColumnId::new(2), 0.5);
-        topo.connect(ColumnId::new(3), ColumnId::new(2), 0.25);
-        let neighbors = topo.neighbors(&ColumnId::new(2));
-        assert_eq!(neighbors.len(), 2);
+    fn history_buffer_evicts_oldest_at_capacity() {
+        let mut buf = HistoryBuffer::new(2);
+        assert!(buf.is_empty());
+        buf.push(HistoryEntry {
+            tick: 1,
+            prediction: "a".into(),
+            confidence: 0.1,
+        });
+        buf.push(HistoryEntry {
+            tick: 2,
+            prediction: "b".into(),
+            confidence: 0.2,
+        });
+        buf.push(HistoryEntry {
+            tick: 3,
+            prediction: "c".into(),
+            confidence: 0.3,
+        });
+        assert_eq!(buf.len(), 2);
+        assert_eq!(
+            buf.iter().map(|e| e.tick).collect::<Vec<_>>(),
+            vec![2, 3],
+            "oldest entry should have been evicted"
+        );
+    }
+
+    #[test]
+    fn history_buffer_zero_capacity_discards() {
+        let mut buf = HistoryBuffer::new(0);
+        buf.push(HistoryEntry {
+            tick: 1,
+            prediction: "a".into(),
+            confidence: 0.1,
+        });
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn parses_physics_output_shape() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{
+            "reference_frame_coordinates": "4.0,12.0,-2.0",
+            "isolated_variables": ["v_kinetic"],
+            "empirical_observation": "Kinetic energy burst along vector",
+            "prediction": "Energy dissipates thermally",
+            "confidence": 0.82
+        }"#;
+        let out: ColumnOutputSchema = serde_json::from_str(json)?;
+        out.validate()?;
+        assert_eq!(out.prediction, "Energy dissipates thermally");
+        assert!(out.domain_fields.contains_key("isolated_variables"));
+        assert!(out.domain_fields.contains_key("empirical_observation"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_math_output_shape() -> Result<(), Box<dyn std::error::Error>> {
+        // Mathematics emits `deductive_synthesis`, not `empirical_observation`.
+        let json = r#"{
+            "reference_frame_coordinates": "tensor[R3]",
+            "axiomatic_assertions": ["|v|=sqrt(164)"],
+            "deductive_synthesis": "Vector magnitude exceeds threshold",
+            "prediction": "Magnitude stabilizes",
+            "confidence": 0.77
+        }"#;
+        let out: ColumnOutputSchema = serde_json::from_str(json)?;
+        out.validate()?;
+        assert!(out.domain_fields.contains_key("deductive_synthesis"));
+        assert!(out.domain_fields.contains_key("axiomatic_assertions"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_coding_and_psychology_shapes() -> Result<(), Box<dyn std::error::Error>> {
+        let code = r#"{
+            "reference_frame_coordinates": "state[INIT]",
+            "state_variables": ["init_step"],
+            "algorithmic_analysis": "Automation init failed at step 0",
+            "prediction": "Retry succeeds",
+            "confidence": 0.69
+        }"#;
+        let psych = r#"{
+            "reference_frame_coordinates": "valence[-]",
+            "cognitive_biases": ["automation_bias"],
+            "behavioral_synthesis": "Operator stress from failure",
+            "prediction": "Manual intervention",
+            "confidence": 0.61
+        }"#;
+        let c: ColumnOutputSchema = serde_json::from_str(code)?;
+        let p: ColumnOutputSchema = serde_json::from_str(psych)?;
+        c.validate()?;
+        p.validate()?;
+        assert!(c.domain_fields.contains_key("algorithmic_analysis"));
+        assert!(p.domain_fields.contains_key("behavioral_synthesis"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_confidence() {
+        let out = ColumnOutputSchema {
+            reference_frame_coordinates: "x".into(),
+            prediction: "p".into(),
+            confidence: 1.5,
+            domain_fields: BTreeMap::new(),
+        };
+        assert!(out.validate().is_err());
+    }
+
+    #[test]
+    fn record_tick_updates_state_and_history() {
+        let mut col = CorticalColumn::with_defaults("CC_X", DomainSphere::Physics);
+        let out = ColumnOutputSchema {
+            reference_frame_coordinates: "1,2,3".into(),
+            prediction: "boom".into(),
+            confidence: 0.42,
+            domain_fields: BTreeMap::new(),
+        };
+        col.record_tick(1, &out);
+        assert_eq!(col.last_prediction, "boom");
+        assert!((col.last_confidence - 0.42).abs() < 1e-6);
+        assert_eq!(col.current_coordinate, "1,2,3");
+        assert_eq!(col.history_buffer.len(), 1);
     }
 }

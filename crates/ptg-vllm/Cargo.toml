@@ -10,4 +10,7 @@ description = "Shared local inference engine (\"thalamus\") client for PTG."
 [dependencies]
 ptg-core = { path = "../ptg-core" }
 async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -5,8 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Core domain types for Project Thousand-Gemma."
+description = "Core domain types and system prompts for Project Thousand-Gemma."
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
