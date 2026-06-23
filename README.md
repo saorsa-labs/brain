@@ -3,7 +3,7 @@
 > A distributed, prompt-based **cortical mesh simulator** written in Rust — implementing the organizational principles of Jeff Hawkins' *Thousand Brains Theory of Intelligence* as a multi-agent system.
 
 [![status](https://img.shields.io/badge/status-v1%20execution%20skeleton-brightgreen)](docs/ROADMAP.md)
-[![license](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](#license)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange)](#getting-started)
 
 ## Overview
@@ -77,4 +77,4 @@ multimodality, and benchmarks — are tracked in the [roadmap](docs/ROADMAP.md).
 
 ## License
 
-AGPL-3.0-or-later © Saorsa Labs. Commercial licensing is available by separate agreement: david@saorsalabs.com.
+Dual-licensed under **MIT** or **Apache-2.0**, at your option ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE)). © 2026 Saorsa Labs.
