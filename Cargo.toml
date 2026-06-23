@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ptg-core",
+    "crates/ptg-vllm",
+    "crates/ptg-consensus",
+    "crates/ptg-runtime",
+    "crates/ptg-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+authors = ["Saorsa Labs <david@saorsalabs.com>"]
+repository = "https://github.com/saorsa-labs/brain"
+homepage = "https://github.com/saorsa-labs/brain"
+description = "Project Thousand-Gemma: a distributed, prompt-based cortical mesh simulator in Rust."
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,13 @@
+[package]
+name = "ptg-vllm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared local inference engine (\"thalamus\") client for PTG."
+
+[dependencies]
+ptg-core = { path = "../ptg-core" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
