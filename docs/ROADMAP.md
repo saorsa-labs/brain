@@ -64,8 +64,7 @@ compute-matched controls pass review. No headline quality claim until then.
 ## Phase 3 — Topologies & convergence depth (in progress)
 
 - [~] Pluggable topologies: ring, torus, small-world (§3.1.3). **Library +
-      runtime landed** (`ptg-core::TopologySpec`, `ptg-runtime::mesh_with_topology`);
-      CLI/bench `--topology` flags deferred until a topology-aware benchmark is wired.
+      runtime + CLI `--topology` flag landed.** `TopologySpec` in `ptg-core`, `mesh_with_topology` in `ptg-runtime`, `--topology/--columns` in `ptg`. Bench `--topology` flag deferred until a topology-aware benchmark is wired.
 - [ ] Weighted / attention-routed lateral connections (§9.1 "Dynamic Topology
       Scaling") — columns choose which neighbors to listen to.
 - [ ] Full **semantic** cosine convergence over prediction embeddings (§9.3),

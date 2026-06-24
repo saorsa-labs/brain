@@ -54,8 +54,33 @@ brain/
 cargo check --workspace                        # type-check all crates
 cargo fmt --all                                # format
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p ptg-cli
+cargo run -p ptg-cli                           # run the default reference mesh
 ```
+
+### Pluggable topologies (Phase 3)
+
+The `--topology` flag selects the lateral mesh layout over `--columns`
+replicated domain spheres. `--dry-run` prints the full wiring (columns +
+listener->source edges) without any inference:
+
+```bash
+# Named 4-column reference graph (default, unchanged)
+cargo run -p ptg-cli --bin ptg -- --dry-run
+
+# Directed ring over 8 columns
+cargo run -p ptg-cli --bin ptg -- --dry-run --topology ring --columns 8
+
+# 3x3 torus (9 columns, 4 neighbors each)
+cargo run -p ptg-cli --bin ptg -- --dry-run --topology torus --torus-width 3 --torus-height 3
+
+# Seeded small-world (deterministic given --small-world-seed)
+cargo run -p ptg-cli --bin ptg -- --dry-run --topology small-world \
+    --columns 20 --small-world-degree 4 --small-world-rewire 0.2
+```
+
+Degeneracy guardrails reject parameters where distinct topologies collapse to
+the same graph (e.g. `ring-bi` with < 4 columns == `fully-connected`; `small-
+world` with `degree*2 >= columns` silently under-rewires).
 
 ## Status
 
