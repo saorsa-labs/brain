@@ -202,10 +202,14 @@ impl CorticalMesh {
                 return Err(err);
             }
 
-            // Phase 3: convergence check.
+            // Phase 3: convergence check. Only consider convergence once we've
+            // run at least `min_ticks` ticks, so an overconfident model can't
+            // short-circuit the lateral-voting mechanism on tick 1.
             let refs: Vec<&CorticalColumn> = self.column_ids_sorted_local_refs();
             let current = confidence_vector(&refs);
-            if quality_converged(&refs, &previous_conf, &current, &self.criteria) {
+            if tick >= self.criteria.min_ticks
+                && quality_converged(&refs, &previous_conf, &current, &self.criteria)
+            {
                 stabilized = true;
                 break;
             }

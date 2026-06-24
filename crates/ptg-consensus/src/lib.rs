@@ -17,6 +17,12 @@ use ptg_core::CorticalColumn;
 pub struct ConvergenceCriteria {
     /// Hard cap on the number of voting ticks per epoch.
     pub max_ticks: u32,
+    /// Do not consider convergence before this tick. Guarantees at least this
+    /// many ticks of lateral-context exchange regardless of confidence. Default
+    /// `1` (preserve legacy behavior). Set higher (e.g. 2) to force the mesh to
+    /// actually exercise lateral voting even when an overconfident model would
+    /// otherwise "converge" on tick 1.
+    pub min_ticks: u32,
     /// Stop once mean column confidence reaches this threshold.
     pub min_mean_confidence: f32,
     /// Stop once mean absolute confidence delta between ticks drops at or below this.
@@ -32,6 +38,7 @@ impl Default for ConvergenceCriteria {
     fn default() -> Self {
         Self {
             max_ticks: 5,
+            min_ticks: 1,
             min_mean_confidence: 0.8,
             max_confidence_delta: 0.02,
             min_cosine_similarity: 0.999,

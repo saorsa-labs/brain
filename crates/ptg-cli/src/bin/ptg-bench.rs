@@ -85,14 +85,23 @@ struct Args {
     /// Max voting ticks for the mesh.
     #[arg(long, default_value_t = 2)]
     max_ticks: u32,
+    /// Minimum ticks before convergence is considered (`mesh_adaptive` only).
+    /// Forces lateral exchange to actually run even when an overconfident model
+    /// would otherwise converge at tick 1. Must be <= --max-ticks.
+    #[arg(long, default_value_t = 2)]
+    min_ticks: u32,
     /// Fixed sampling seed (reproducibility; confound M4).
     #[arg(long, default_value_t = 20260623u64)]
     seed: u64,
     /// Per-column completion cap for the mesh (tokens).
-    #[arg(long, default_value_t = 512u32)]
+    #[arg(long, default_value_t = 1024u32)]
     max_tokens_col: u32,
-    /// Monolithic completion cap = N × per-column (fairness: equal total budget).
-    #[arg(long, default_value_t = 4)]
+    /// Monolithic completion cap override (tokens). If set, used directly;
+    /// otherwise = --max-tokens-col × --mono-budget-multiplier.
+    #[arg(long)]
+    max_tokens_mono: Option<u32>,
+    /// Monolithic completion cap multiplier when --max-tokens-mono is unset.
+    #[arg(long, default_value_t = 2)]
     mono_budget_multiplier: u32,
     /// Output root (a timestamped subdir is created inside it).
     #[arg(long, default_value = "bench-runs")]
@@ -167,6 +176,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    if args.min_ticks > args.max_ticks {
+        return Err(format!(
+            "--min-ticks ({}) must be <= --max-ticks ({})",
+            args.min_ticks, args.max_ticks
+        )
+        .into());
+    }
     let conditions: Vec<Condition> = match args.only {
         Some(c) => vec![c],
         None => vec![
@@ -191,12 +207,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join(", ")
         );
         eprintln!(
-            "  repeats: {}, max_ticks: {}, seed: {}",
-            args.repeats, args.max_ticks, args.seed
+            "  repeats: {}, ticks: min={} max={}, seed: {}",
+            args.repeats, args.min_ticks, args.max_ticks, args.seed
+        );
+        let mono_disp = args.max_tokens_mono.map_or_else(
+            || {
+                format!(
+                    "{}x (col×{})",
+                    args.mono_budget_multiplier, args.mono_budget_multiplier
+                )
+            },
+            |m| m.to_string(),
         );
         eprintln!(
-            "  max_tokens_col: {}, mono_budget: {}x",
-            args.max_tokens_col, args.mono_budget_multiplier
+            "  max_tokens_col: {}, max_tokens_mono: {}",
+            args.max_tokens_col, mono_disp
         );
         eprintln!("  prompts ({}):", prompts.len());
         for (id, p) in &prompts {
@@ -240,9 +265,10 @@ async fn run_bench(
         .seed(Some(args.seed))
         .metrics_sink(mesh_dyn)
         .build()?;
-    let mono_max = args
-        .max_tokens_col
-        .saturating_mul(args.mono_budget_multiplier);
+    let mono_max = args.max_tokens_mono.unwrap_or_else(|| {
+        args.max_tokens_col
+            .saturating_mul(args.mono_budget_multiplier)
+    });
     let mono_engine = Arc::new(
         InferenceEngine::builder(&args.vllm_url, &args.model)
             .temperature(BENCH_TEMPERATURE)
@@ -422,6 +448,7 @@ async fn run_mesh(
 ) -> Result<(serde_json::Value, MeshExtras), String> {
     let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
     mesh.criteria.max_ticks = args.max_ticks;
+    mesh.criteria.min_ticks = args.min_ticks;
     let threshold = mesh.criteria.min_integration_confidence;
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
     let outputs: Vec<serde_json::Value> = result
@@ -613,12 +640,14 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
         args.vllm_url, args.model
     ));
     s.push_str(&format!(
-        "- temperature: {}, seed: {:?}, max_ticks: {}, max_tokens_col: {}, mono_budget: {}x\n",
+        "- temperature: {}, seed: {:?}, ticks(min/max): {}/{}, max_tokens_col: {}, max_tokens_mono: {} ({})\n",
         BENCH_TEMPERATURE,
         Some(args.seed),
+        args.min_ticks,
         args.max_ticks,
         args.max_tokens_col,
-        args.mono_budget_multiplier
+        args.max_tokens_mono.unwrap_or_else(|| args.max_tokens_col.saturating_mul(args.mono_budget_multiplier)),
+        if args.max_tokens_mono.is_some() { "explicit" } else { "col×mult" },
     ));
     s.push_str(&format!(
         "- Conditions: {}  Repeats/prompt: {}\n",

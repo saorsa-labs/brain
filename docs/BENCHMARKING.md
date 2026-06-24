@@ -85,9 +85,34 @@ Identical across all conditions:
   system prompt inside a single `user` message (no `system` role); the baseline
   will use the **same convention** so the prefix-cache boundary and attention
   behavior match.
-- Per-column completion cap for the mesh; `mono_all_prompts` cap = `4 ×` that; any
-  `finish_reason == "length"` truncation is **flagged as a scored failure** on both
-  sides.
+- Per-column completion cap for the mesh (`--max-tokens-col`, default 1024);
+  the monolithic cap is `--max-tokens-mono` (default `--max-tokens-col × 2`) and
+  must fit the server's `-c 4096` context. Any `finish_reason == "length"`
+  truncation is **flagged as a scored failure** on both sides.
+- **Forced minimum ticks for the mesh** (`--min-ticks`, default 2). Because an
+  overconfident model can self-report `mean_confidence ≥ min_mean_confidence` on
+  tick 1 — converging before any lateral exchange — the benchmark forces
+  `min_ticks ≥ 2` for `mesh_adaptive` so the lateral-voting mechanism is actually
+  exercised. `sphere_x4_no_lateral` stays forced at `max_ticks = 1`.
+
+## Pilot findings (mechanism)
+
+The harness-validation pilot revealed a genuine V1 finding, recorded here for
+provenance:
+
+- **Confidence-vector convergence is vulnerable to overconfident self-reports.**
+  With `gemma-4-e4b`, the model self-reports `confidence ≈ 1.0` on every column,
+  so the default mesh (without `min_ticks`) "converges" at tick 1 every time and
+  the lateral-voting mechanism is **never exercised**. This is itself a result
+  about the V1 mesh: confidence-based convergence on a non-calibrated model is
+  non-functional, and `min_ticks` is a necessary workaround. The benchmark's
+  "mechanism unmeasured this round" guard surfaces this automatically.
+- **Output truncation dominates early failures.** The math column is verbose and
+  overflows a 512-token cap → malformed JSON. Raising the per-column cap (and the
+  monolithic cap to match, within `-c 4096`) eliminates this.
+- A **true equal-call mechanism ablation** (`sphere_x8_no_lateral` / forced-2-tick
+  no-lateral) is deferred to the quality/scaled phase (A3): a naive 8-call
+  control at `temperature: 0` would just repeat identical calls.
 
 ## Metrics
 
