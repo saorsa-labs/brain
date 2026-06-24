@@ -167,6 +167,15 @@ would turn this pilot signal into evidence.
 > does not rely on the self-reported confidence a model can game — the same
 > `tick_outputs` / `convergence_reason` plumbing gives us the within-run
 > measurement needed to study homogenization directly.
+>
+> **Second mitigation shipped (Phase 3B):** diversity-preserving lateral
+> routing (`--routing-policy diversity`, MMR-style selection that keeps
+> dissimilar neighbor frames in context instead of majority-voting them away).
+> On a single live run it preserved a niche column's frame that plain `all`
+> voting had erased (the psych column held its operator-discount framing at
+> 0.92 conf instead of collapsing to physics "catastrophic failure" language at
+> 0.98). Every routing decision is observable per-tick (`tick_outputs.routes`),
+> so homogenization can now be measured, not just observed.
 
 ## Status
 

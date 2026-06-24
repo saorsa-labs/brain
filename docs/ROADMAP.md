@@ -72,10 +72,14 @@ compute-matched controls pass review. No headline quality claim until then.
       self-reported confidence a model can game. Surfaced via
       `--min-prediction-similarity 0.0..1.0` and reported as
       `MeshResult.convergence_reason`.
-- [ ] Weighted / attention-routed lateral connections (§9.1 "Dynamic Topology
-      Scaling") — columns choose which neighbors to listen to. The hypothesized
-      mitigation for the homogenization signal (see README *Early research
-      signal*); lead with diversity-preserving routing, not pure confidence-top-k.
+- [x] Weighted / attention-routed lateral connections (§9.1 "Dynamic Topology
+      Scaling") — runtime **and** CLI landed. `RoutingPolicy` enum
+      (`All` / `ConfidenceTopK{k}` / `DiversityPreserving{k}`, MMR-style using
+      token-Jaccard) in `ptg-runtime`; `--routing-policy` + `--routing-k` CLI
+      flags; full per-tick observability via `TickOutputs.routes` /
+      `RouteDecision` / `RoutedSource`. Diversity-preserving routing is the
+      hypothesized mitigation for the homogenization signal — a single live run
+      showed it preserving a niche column's frame that `all` voting had erased.
 - [ ] Full **semantic** cosine convergence over prediction embeddings (§9.3) —
       blocked: the live server returns HTTP 501 on `/v1/embeddings`. The cheap
       token-Jaccard proxy above is the unblocked approximation.

@@ -145,6 +145,27 @@ cargo run -p ptg-cli --bin ptg -- --dry-run --topology small-world \
     --columns 20 --small-world-degree 4 --small-world-rewire 0.2
 ```
 
+### Routing policies (lateral attention)
+
+By default every column hears from **all** its neighbors (`--routing-policy
+all`). That can homogenize the mesh: high-confidence / high-level frames tend to
+overwrite niche ones. Two alternatives let a column listen selectively:
+
+```bash
+# Hear only the 2 highest-confidence neighbors
+--routing-policy confidence-top-k --routing-k 2
+
+# MMR-style diversity-preserving: keep up to 2 dissimilar neighbors
+# (the hypothesized mitigation for lateral homogenization)
+--routing-policy diversity --routing-k 2
+```
+
+Diversity routing anchors on the highest-confidence source, then greedily adds
+sources that are most *different* (by token overlap) from what it already heard
+— so dissident/niche frames survive. Every routing decision is captured per-tick
+in `tick_outputs.routes` (`route_weight` + `confidence` per source), so you can
+measure how much each column attended to each neighbor.
+
 ---
 
 ## 8. Column packs and the abstraction-level experiment

@@ -19,7 +19,7 @@ use futures::future::join_all;
 use ndarray::Array1;
 use ptg_consensus::{
     confidence_converged, confidence_vector, mean_confidence, prediction_similarity_converged,
-    ConvergenceCriteria, ConvergenceReason,
+    token_jaccard_similarity, ConvergenceCriteria, ConvergenceReason,
 };
 use ptg_core::{
     ColumnOutputSchema, CorticalColumn, LateralConnection, Stimulus, TopologyError, TopologySpec,
@@ -47,6 +47,55 @@ pub enum MeshError {
     Topology(#[from] TopologyError),
 }
 
+/// How a column selects which neighbors' predictions to inject as lateral
+/// context (§9.1 "Dynamic Topology Scaling"). Phase 3B.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum RoutingPolicy {
+    /// Inject every neighbor (with a non-empty prediction) equally. The
+    /// original V1 behavior and the default.
+    #[default]
+    All,
+    /// Inject only the `k` highest-confidence neighbors (ties broken by source
+    /// id ascending). Each selected source's weight is its own confidence.
+    ConfidenceTopK { k: usize },
+    /// Diversity-preserving (MMR-style) selection: anchor on the highest-
+    /// confidence source, then greedily add sources that maximize
+    /// `0.5 * confidence + 0.5 * (1 - max token-Jaccard to any already-selected)`.
+    /// Up to `k` sources. The hypothesized mitigation for the homogenization
+    /// signal: it keeps dissident/niche frames in the context instead of
+    /// majority-voting them away. The anchor's weight is its confidence; each
+    /// later source's weight is its selection score.
+    DiversityPreserving { k: usize },
+}
+
+/// One source a listener column hears from on a given tick, with the attention
+/// weight the routing policy assigned it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutedSource {
+    pub source_id: String,
+    /// Attention weight the policy assigned: `1.0` for `All`, source confidence
+    /// for `ConfidenceTopK`, selection score for `DiversityPreserving`.
+    pub weight: f32,
+    /// The source's own self-reported confidence at the tick it was heard.
+    pub confidence: f32,
+}
+
+/// A single listener's routing decision for one tick (observability for
+/// homogenization experiments; §9.1).
+#[derive(Debug, Clone)]
+pub struct RouteDecision {
+    pub listener_id: String,
+    pub sources: Vec<RoutedSource>,
+}
+
+/// The lateral context for one listener: the rendered prompt fragment plus the
+/// routing decision it was built from.
+#[derive(Debug, Clone)]
+struct RoutedLateralContext {
+    text: String,
+    sources: Vec<RoutedSource>,
+}
+
 /// The orchestrator tracking column population and topology (§3.1.3, §8.2).
 pub struct CorticalMesh {
     /// Columns keyed by id.
@@ -57,6 +106,8 @@ pub struct CorticalMesh {
     pub engine: Arc<dyn ColumnEngine>,
     /// When to stop the consensus loop.
     pub criteria: ConvergenceCriteria,
+    /// How each column selects which neighbors to listen to (§9.1). Default `All`.
+    pub routing_policy: RoutingPolicy,
 }
 
 impl CorticalMesh {
@@ -68,6 +119,7 @@ impl CorticalMesh {
             adjacency_list: HashMap::new(),
             engine,
             criteria: ConvergenceCriteria::default(),
+            routing_policy: RoutingPolicy::default(),
         }
     }
 
@@ -125,28 +177,84 @@ impl CorticalMesh {
     }
 
     /// Build the injected lateral context for a column from its neighbors'
-    /// most recent predictions (§6 Phase 2). Empty until neighbors have output.
-    fn lateral_context_for(&self, id: &str) -> String {
-        let Some(neighbor_ids) = self.adjacency_list.get(id) else {
-            return String::new();
-        };
-        let mut lines = Vec::new();
-        for nid in neighbor_ids {
-            let Some(n) = self.columns.get(nid) else {
-                continue;
+    /// most recent predictions (§6 Phase 2), selecting/weighting sources per
+    /// [`routing_policy`](CorticalMesh::routing_policy) (§9.1). Returns the
+    /// rendered prompt fragment and the routing decision. Both are empty until
+    /// neighbors have produced a prediction.
+    fn lateral_context_for(&self, id: &str) -> RoutedLateralContext {
+        let sources = self.select_lateral_sources(id);
+        if sources.is_empty() {
+            return RoutedLateralContext {
+                text: String::new(),
+                sources,
             };
-            if n.last_prediction.is_empty() {
-                continue;
-            }
-            lines.push(format!(
-                "Neighbor {} reports: Prediction=\"{}\" (Confidence: {:.2})",
-                n.id, n.last_prediction, n.last_confidence
-            ));
         }
-        if lines.is_empty() {
-            String::new()
-        } else {
-            format!("[LATERAL LAYER UPDATE]\n{}", lines.join("\n"))
+        let mut lines = Vec::with_capacity(sources.len());
+        for s in &sources {
+            let pred = self
+                .columns
+                .get(&s.source_id)
+                .map(|c| c.last_prediction.as_str())
+                .unwrap_or_default();
+            let line = match self.routing_policy {
+                RoutingPolicy::All => format!(
+                    "Neighbor {} reports: Prediction=\"{}\" (Confidence: {:.2})",
+                    s.source_id, pred, s.confidence,
+                ),
+                RoutingPolicy::ConfidenceTopK { .. }
+                | RoutingPolicy::DiversityPreserving { .. } => format!(
+                    "Neighbor {} [route_weight={:.2}, confidence={:.2}] reports: Prediction=\"{}\"",
+                    s.source_id, s.weight, s.confidence, pred,
+                ),
+            };
+            lines.push(line);
+        }
+        RoutedLateralContext {
+            text: format!("[LATERAL LAYER UPDATE]\n{}", lines.join("\n")),
+            sources,
+        }
+    }
+
+    /// Select (and weight) the lateral sources a listener column will hear
+    /// from, per the active routing policy. Neighbors with no prediction are
+    /// dropped (they carry nothing to inject).
+    fn select_lateral_sources(&self, listener_id: &str) -> Vec<RoutedSource> {
+        let Some(neighbor_ids) = self.adjacency_list.get(listener_id) else {
+            return Vec::new();
+        };
+        let candidates: Vec<&CorticalColumn> = neighbor_ids
+            .iter()
+            .filter_map(|nid| self.columns.get(nid))
+            .filter(|c| !c.last_prediction.is_empty())
+            .collect();
+        match self.routing_policy {
+            RoutingPolicy::All => candidates
+                .iter()
+                .map(|c| RoutedSource {
+                    source_id: c.id.clone(),
+                    weight: 1.0,
+                    confidence: c.last_confidence,
+                })
+                .collect(),
+            RoutingPolicy::ConfidenceTopK { k } => {
+                let mut ordered = candidates.clone();
+                // highest confidence first; deterministic tie-break by id asc.
+                ordered.sort_by(|a, b| {
+                    b.last_confidence
+                        .total_cmp(&a.last_confidence)
+                        .then(a.id.cmp(&b.id))
+                });
+                ordered
+                    .into_iter()
+                    .take(k)
+                    .map(|c| RoutedSource {
+                        source_id: c.id.clone(),
+                        weight: c.last_confidence,
+                        confidence: c.last_confidence,
+                    })
+                    .collect()
+            }
+            RoutingPolicy::DiversityPreserving { k } => diversity_preserving_select(&candidates, k),
         }
     }
 
@@ -171,13 +279,20 @@ impl CorticalMesh {
             // Phase 1 + 2 prep: gather deterministic per-column context.
             let mut tasks: Vec<(String, CorticalColumn, String)> =
                 Vec::with_capacity(self.columns.len());
+            let mut tick_routes: Vec<RouteDecision> = Vec::new();
             for id in &self.column_ids_sorted() {
                 let Some(col) = self.columns.get(id) else {
                     continue;
                 };
                 let col = col.clone();
-                let ctx = self.lateral_context_for(id);
-                tasks.push((id.clone(), col, ctx));
+                let routed = self.lateral_context_for(id);
+                if !routed.sources.is_empty() {
+                    tick_routes.push(RouteDecision {
+                        listener_id: id.clone(),
+                        sources: routed.sources,
+                    });
+                }
+                tasks.push((id.clone(), col, routed.text));
             }
 
             // Phase 1 + 2 exec: concurrent column ticks against the shared engine.
@@ -220,6 +335,7 @@ impl CorticalMesh {
             tick_outputs.push(TickOutputs {
                 tick,
                 outputs: last_outputs.clone(),
+                routes: tick_routes,
             });
 
             // Phase 3: convergence check. Only consider convergence once we've
@@ -286,6 +402,64 @@ impl CorticalMesh {
     }
 }
 
+/// MMR-style diversity-preserving source selection (§9.1). Anchor on the
+/// highest-confidence candidate, then greedily add candidates maximizing
+/// `0.5 * confidence + 0.5 * (1 - max token-Jaccard to any already-selected)`.
+/// Tie-breaks deterministically: score desc, confidence desc, id asc. Returns up
+/// to `k` sources (fewer if there are not enough candidates).
+fn diversity_preserving_select(candidates: &[&CorticalColumn], k: usize) -> Vec<RoutedSource> {
+    if k == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+    // Owned (id, prediction, confidence) triples for borrow-free selection.
+    let mut pool: Vec<(String, String, f32)> = candidates
+        .iter()
+        .map(|c| (c.id.clone(), c.last_prediction.clone(), c.last_confidence))
+        .collect();
+    // Anchor priority: confidence desc, id asc.
+    pool.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+    let Some((first, rest)) = pool.split_first() else {
+        return Vec::new();
+    };
+    let (aid, apred, aconf) = first.clone();
+    let mut selected_preds: Vec<String> = vec![apred];
+    let mut result: Vec<RoutedSource> = vec![RoutedSource {
+        source_id: aid,
+        weight: aconf,
+        confidence: aconf,
+    }];
+    let mut remaining: Vec<(String, String, f32)> = rest.to_vec();
+    while result.len() < k && !remaining.is_empty() {
+        let mut scored: Vec<(f32, String, String, f32)> = remaining
+            .iter()
+            .map(|(id, pred, conf)| {
+                let max_sim = selected_preds
+                    .iter()
+                    .map(|sp| token_jaccard_similarity(pred, sp))
+                    .fold(0.0f32, f32::max);
+                let score = 0.5 * conf + 0.5 * (1.0 - max_sim);
+                (score, id.clone(), pred.clone(), *conf)
+            })
+            .collect();
+        // score desc, confidence desc, id asc.
+        scored.sort_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then(b.3.total_cmp(&a.3))
+                .then(a.1.cmp(&b.1))
+        });
+        if let Some((score, wid, wpred, wconf)) = scored.into_iter().next() {
+            result.push(RoutedSource {
+                source_id: wid.clone(),
+                weight: score,
+                confidence: wconf,
+            });
+            selected_preds.push(wpred);
+            remaining.retain(|(id, _, _)| *id != wid);
+        }
+    }
+    result
+}
+
 /// The per-column outputs captured at a single executed tick.
 #[derive(Debug, Clone)]
 pub struct TickOutputs {
@@ -293,6 +467,10 @@ pub struct TickOutputs {
     pub tick: u32,
     /// Per-column outputs at this tick (all columns, sorted-id order).
     pub outputs: Vec<(String, ColumnOutputSchema)>,
+    /// Lateral routing decisions used to build THIS tick's prompts (§9.1).
+    /// Empty on tick 1 (no prior predictions to route) and for any listener
+    /// that selected no sources.
+    pub routes: Vec<RouteDecision>,
 }
 
 /// Result of one completed epoch.
@@ -686,5 +864,145 @@ mod tests {
             },
         );
         assert!(matches!(res, Err(MeshError::Topology(_))));
+    }
+
+    // ---- Phase 3B: lateral routing (§9.1) ----
+
+    /// Build a single-listener mesh whose neighbors carry explicit
+    /// (prediction, confidence) state, for routing-selection unit tests.
+    fn routed_mesh(
+        listener: &str,
+        neighbors: &[(&str, &str, f32)],
+    ) -> Result<CorticalMesh, Box<dyn std::error::Error>> {
+        let mut mesh = CorticalMesh::new(Arc::new(LowConfEngine));
+        mesh.add_column(CorticalColumn::with_defaults(
+            listener,
+            DomainSphere::Physics,
+        ))?;
+        for (id, _, _) in neighbors {
+            mesh.add_column(CorticalColumn::with_defaults(id, DomainSphere::Mathematics))?;
+            mesh.establish_lateral_connection(listener, id)?;
+        }
+        for (id, pred, conf) in neighbors {
+            if let Some(c) = mesh.columns.get_mut(*id) {
+                c.last_prediction = (*pred).to_string();
+                c.last_confidence = *conf;
+            }
+        }
+        Ok(mesh)
+    }
+
+    fn routed_source_ids(sources: &[RoutedSource]) -> Vec<String> {
+        let mut v: Vec<String> = sources.iter().map(|s| s.source_id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn all_routing_selects_all_non_empty_neighbors() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mesh = routed_mesh(
+            "CC_L",
+            &[
+                ("CC_A", "pred a", 0.5),
+                ("CC_B", "pred b", 0.9),
+                ("CC_C", "", 0.99),
+            ],
+        )?;
+        mesh.routing_policy = RoutingPolicy::All;
+        let sources = mesh.select_lateral_sources("CC_L");
+        // CC_C has an empty prediction -> dropped.
+        assert_eq!(
+            routed_source_ids(&sources),
+            vec!["CC_A".to_string(), "CC_B".to_string()]
+        );
+        for s in &sources {
+            assert!((s.weight - 1.0).abs() < 1e-6, "All weights are 1.0");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn confidence_top_k_selects_highest_confidence_with_deterministic_ties(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut mesh = routed_mesh(
+            "CC_L",
+            &[
+                ("CC_B", "pred b", 0.8),
+                ("CC_A", "pred a", 0.8),
+                ("CC_C", "pred c", 0.5),
+            ],
+        )?;
+        mesh.routing_policy = RoutingPolicy::ConfidenceTopK { k: 2 };
+        let sources = mesh.select_lateral_sources("CC_L");
+        // tie at 0.8 broken by id asc -> A, B; C excluded.
+        assert_eq!(
+            routed_source_ids(&sources),
+            vec!["CC_A".to_string(), "CC_B".to_string()]
+        );
+        assert!(sources
+            .iter()
+            .all(|s| (s.weight - s.confidence).abs() < 1e-6));
+        Ok(())
+    }
+
+    #[test]
+    fn diversity_preserving_prefers_dissimilar_over_redundant_high_conf(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut mesh = routed_mesh(
+            "CC_L",
+            &[
+                ("CC_ANCHOR", "alpha beta gamma", 0.9),
+                ("CC_REDUNDANT", "alpha beta gamma delta", 0.85),
+                ("CC_NOVEL", "completely different tokens zeta", 0.6),
+            ],
+        )?;
+        mesh.routing_policy = RoutingPolicy::DiversityPreserving { k: 2 };
+        let sources = mesh.select_lateral_sources("CC_L");
+        let ids = routed_source_ids(&sources);
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.contains(&"CC_ANCHOR".to_string()),
+            "highest-conf anchor always selected"
+        );
+        assert!(
+            ids.contains(&"CC_NOVEL".to_string()),
+            "dissimilar source preferred"
+        );
+        assert!(
+            !ids.contains(&"CC_REDUNDANT".to_string()),
+            "redundant high-conf dropped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn k_zero_selects_no_sources() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mesh = routed_mesh("CC_L", &[("CC_A", "pred a", 0.9)])?;
+        mesh.routing_policy = RoutingPolicy::DiversityPreserving { k: 0 };
+        assert!(mesh.select_lateral_sources("CC_L").is_empty());
+        mesh.routing_policy = RoutingPolicy::ConfidenceTopK { k: 0 };
+        assert!(mesh.select_lateral_sources("CC_L").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_epoch_captures_route_decisions_for_tick_2(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut mesh = default_mesh(Arc::new(MockEngine))?;
+        mesh.criteria.min_ticks = 2; // force 2 ticks so lateral exchange runs
+        mesh.criteria.max_ticks = 2;
+        let result = mesh.run_text_epoch("stimulus").await?;
+        assert_eq!(result.tick_outputs.len(), 2, "ran 2 ticks");
+        assert!(
+            result.tick_outputs[0].routes.is_empty(),
+            "tick 1 has no prior predictions"
+        );
+        let tick2 = &result.tick_outputs[1];
+        // Default topology has 3 lateral receivers (PHYSICS, MATH, CODE); PSYCH is a sink.
+        assert_eq!(tick2.routes.len(), 3, "three receivers route on tick 2");
+        for dec in &tick2.routes {
+            assert!(!dec.sources.is_empty(), "each receiver selected >=1 source");
+        }
+        Ok(())
     }
 }

@@ -127,6 +127,19 @@ struct Cli {
     /// Small-world PRNG seed (default 42). Same seed -> same graph.
     #[arg(long, default_value_t = 42)]
     small_world_seed: u64,
+
+    /// Lateral routing policy (§9.1): how each column selects which neighbors'
+    /// predictions to inject. `all` (default, V1) injects every neighbor;
+    /// `confidence-top-k` injects the k highest-confidence; `diversity`
+    /// diversity-preserving (MMR) selection that keeps dissimilar frames — the
+    /// hypothesized mitigation for lateral homogenization.
+    #[arg(long, value_enum, default_value_t = RoutingPolicyKind::All)]
+    routing_policy: RoutingPolicyKind,
+
+    /// Source budget for `--routing-policy confidence-top-k` / `diversity`
+    /// (default 2). Ignored for `all`.
+    #[arg(long, default_value_t = 2)]
+    routing_k: usize,
 }
 
 /// Selectable lateral topologies for `--topology`.
@@ -172,6 +185,39 @@ impl TopologyKind {
             Self::Torus => "torus",
             Self::FullyConnected => "fully-connected",
             Self::SmallWorld => "small-world",
+        }
+    }
+}
+
+/// CLI mirror of [`ptg_runtime::RoutingPolicy`] (§9.1). `All` is the default and
+/// preserves V1 behavior; the other two take a budget `k` via `--routing-k`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum RoutingPolicyKind {
+    /// Inject every neighbor equally (V1 behavior).
+    All,
+    /// Inject the k highest-confidence neighbors.
+    ConfidenceTopK,
+    /// MMR-style diversity-preserving selection of up to k neighbors.
+    Diversity,
+}
+
+impl RoutingPolicyKind {
+    /// Materialize into the runtime policy with the supplied budget.
+    fn to_policy(self, k: usize) -> ptg_runtime::RoutingPolicy {
+        match self {
+            Self::All => ptg_runtime::RoutingPolicy::All,
+            Self::ConfidenceTopK => ptg_runtime::RoutingPolicy::ConfidenceTopK { k },
+            Self::Diversity => ptg_runtime::RoutingPolicy::DiversityPreserving { k },
+        }
+    }
+
+    /// The kebab-case flag value the user would type (for dry-run / errors).
+    fn kebab(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::ConfidenceTopK => "confidence-top-k",
+            Self::Diversity => "diversity",
         }
     }
 }
@@ -449,6 +495,11 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
                 }
             }
         }
+        let k_label = match cli.routing_policy {
+            RoutingPolicyKind::All => String::new(),
+            _ => format!(" k={}", cli.routing_k),
+        };
+        println!("  routing  : {}{k_label}", cli.routing_policy.kebab());
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -520,6 +571,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
     mesh.criteria.max_ticks = cli.ticks;
     mesh.criteria.min_ticks = cli.min_ticks;
     mesh.criteria.min_prediction_similarity = cli.min_prediction_similarity;
+    mesh.routing_policy = cli.routing_policy.to_policy(cli.routing_k);
 
     // 3. Broadcast stimulus and run the decentralized consensus epoch.
     println!("Broadcast Input Signal: '{}'", stimulus.text_str());
@@ -585,6 +637,8 @@ mod tests {
             small_world_degree: 4,
             small_world_rewire: 0.10,
             small_world_seed: 42,
+            routing_policy: RoutingPolicyKind::All,
+            routing_k: 2,
         }
     }
 
