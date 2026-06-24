@@ -468,13 +468,26 @@ async fn run_mesh(
     mesh.criteria.max_ticks = args.max_ticks;
     mesh.criteria.min_ticks = args.min_ticks;
     let threshold = mesh.criteria.min_integration_confidence;
+    // Columns that RECEIVE lateral context (have at least one neighbor).
+    // In the default topology this is {PHYSICS, MATH, CODE}; PSYCH listens to
+    // nobody, so its tick-1 and tick-2 outputs are byte-identical at temp 0 —
+    // making PSYCH a free determinism-validity gate (see BENCHMARKING.md).
+    let receivers = lateral_receivers(&mesh);
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
+    let last_tick = result.ticks_run;
     let outputs: Vec<serde_json::Value> = result
         .outputs
         .iter()
-        .map(|(id, schema)| canonical_column(id, schema, threshold))
+        .map(|(id, schema)| {
+            canonical_column(
+                id,
+                schema,
+                threshold,
+                lateral_active(last_tick, id, &receivers),
+            )
+        })
         .collect();
-    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold));
+    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold, &receivers));
     let extras = MeshExtras {
         ticks_run: Some(result.ticks_run),
         stabilized: Some(result.stabilized),
@@ -499,13 +512,22 @@ async fn run_mesh_one_tick(
     let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
     mesh.criteria.max_ticks = 1;
     let threshold = mesh.criteria.min_integration_confidence;
+    let receivers = lateral_receivers(&mesh);
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
+    let last_tick = result.ticks_run;
     let outputs: Vec<serde_json::Value> = result
         .outputs
         .iter()
-        .map(|(id, schema)| canonical_column(id, schema, threshold))
+        .map(|(id, schema)| {
+            canonical_column(
+                id,
+                schema,
+                threshold,
+                lateral_active(last_tick, id, &receivers),
+            )
+        })
         .collect();
-    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold));
+    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold, &receivers));
     let extras = MeshExtras {
         ticks_run: Some(result.ticks_run),
         stabilized: Some(result.stabilized),
@@ -555,11 +577,17 @@ fn mono_prompt(stimulus: &Stimulus) -> String {
     )
 }
 
-fn canonical_column(id: &str, schema: &ColumnOutputSchema, threshold: f32) -> serde_json::Value {
+fn canonical_column(
+    id: &str,
+    schema: &ColumnOutputSchema,
+    threshold: f32,
+    lateral_active: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "column_id": id,
         "sphere": sphere_name(schema),
         "accepted": schema.confidence >= threshold,
+        "lateral_active": lateral_active,
         "schema": schema,
     })
 }
@@ -568,18 +596,46 @@ fn canonical_column(id: &str, schema: &ColumnOutputSchema, threshold: f32) -> se
 /// tick, in execution order. Each entry is `{tick, outputs: [canonical_column...]}`.
 /// This gives downstream analysis the within-run mechanism signal: tick 1 (no
 /// lateral context) vs tick 2 (lateral context injected).
-fn canonical_ticks(ticks: &[TickOutputs], threshold: f32) -> Vec<serde_json::Value> {
+fn canonical_ticks(
+    ticks: &[TickOutputs],
+    threshold: f32,
+    receivers: &std::collections::BTreeSet<String>,
+) -> Vec<serde_json::Value> {
     ticks
         .iter()
         .map(|t| {
             let cols: Vec<serde_json::Value> = t
                 .outputs
                 .iter()
-                .map(|(id, schema)| canonical_column(id, schema, threshold))
+                .map(|(id, schema)| {
+                    canonical_column(id, schema, threshold, lateral_active(t.tick, id, receivers))
+                })
                 .collect();
             serde_json::json!({ "tick": t.tick, "outputs": cols })
         })
         .collect()
+}
+
+/// The set of column ids that RECEIVE lateral context (have at least one
+/// neighbor in the mesh's directed adjacency). In the default topology this is
+/// {CC_PHYSICS_01, CC_MATH_01, CC_CODE_01}; CC_PSYCH_01 listens to nobody.
+fn lateral_receivers(mesh: &ptg_runtime::CorticalMesh) -> std::collections::BTreeSet<String> {
+    mesh.adjacency_list
+        .iter()
+        .filter(|(_, nbrs)| !nbrs.is_empty())
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Whether `column_id` actually received non-empty lateral context on `tick`.
+/// Lateral context is empty on tick 1 (no prior ticks recorded) and non-empty
+/// on tick >= 2 only for columns that have neighbors (the receivers).
+fn lateral_active(
+    tick: u32,
+    column_id: &str,
+    receivers: &std::collections::BTreeSet<String>,
+) -> bool {
+    tick >= 2 && receivers.contains(column_id)
 }
 
 /// Map a column's output to its perspective label, derived from which sphere-

@@ -159,6 +159,35 @@ No embeddings, so quality uses a same-server **pairwise blind judge**:
   sample; treat judge scores as **provisional** until a distinct stronger judge
   is available.
 
+### A2 scope: mechanism ACTIVATION, not consensus benefit
+
+**What A2 can prove (with the judge):** does lateral context *activate / perturb /
+improve individual columns*? The primary comparison is the **within-run,
+per-column, tick-2 vs tick-1 delta** for the **3 lateral-receiving columns**
+(`CC_PHYSICS_01`, `CC_MATH_01`, `CC_CODE_01`) — paired, blind, A/B-swapped. This
+isolate the lateral string with zero compute confound and zero cross-run
+determinism dependence.
+
+**What A2 cannot prove:** that the mesh reaches *better consensus*. There is **no
+integration step in v0** — "voting" is confidence filtering, not an emergent
+consensus object — so "emergent consensus across columns" is not representable
+in the outputs at all. A2 is a **mechanism-activation** result, not a thesis-level
+verdict.
+
+**`CC_PSYCH_01` is a free determinism gate, not a data point.** It has no
+incoming lateral edges, so its tick-1 and tick-2 outputs must be byte-identical
+at `temperature: 0`. If they differ, temp-0 determinism is violated and *all*
+deltas from that run are suspect → the run is flagged `determinism_failed` and
+excluded from mechanism comparisons.
+
+**Secondary comparisons** (directional only, caveated): mesh-final vs
+`sphere_x4_no_lateral` (cross-run determinism risk + 8-vs-4 call asymmetry); and
+mesh-final vs `mono_all_prompts`. Neither can stand alone as a mechanism claim.
+
+**Thesis-level consensus verdict** requires either a future explicit
+consensus/integration artifact or the A3 equal-call no-lateral ablation
+(`sphere_x8_no_lateral`).
+
 Comparisons are deliberately separated into three questions:
 
 1. **Diversity/compute (no mechanism):** does having 4 different sphere prompts
