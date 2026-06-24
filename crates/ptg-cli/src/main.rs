@@ -42,6 +42,12 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     ticks: u32,
 
+    /// Minimum number of ticks before convergence is considered (forces lateral
+    /// exchange to run even when columns are overconfident on tick 1). Default 1;
+    /// set >= 2 to actually exercise the lateral mechanism on overconfident models.
+    #[arg(long, default_value_t = 1)]
+    min_ticks: u32,
+
     /// Input stimulus broadcast to all columns.
     #[arg(long, default_value = DEFAULT_INPUT)]
     input: String,
@@ -389,6 +395,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
         None => default_mesh(engine)?,
     };
     mesh.criteria.max_ticks = cli.ticks;
+    mesh.criteria.min_ticks = cli.min_ticks;
 
     // 3. Broadcast stimulus and run the decentralized consensus epoch.
     println!("Broadcast Input Signal: '{}'", stimulus.text_str());
@@ -434,6 +441,7 @@ mod tests {
             vllm_url: String::new(),
             model: String::new(),
             ticks: 5,
+            min_ticks: 1,
             input: String::new(),
             image_urls: Vec::new(),
             image_detail: String::from("auto"),
