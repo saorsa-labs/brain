@@ -82,6 +82,28 @@ simply running out of ticks. **Full semantic cosine over prediction embeddings
 is future work** (§9.3): it requires an embedding backend the V1 engine doesn't
 expose.
 
+### Known limitation: confidence convergence assumes a calibrated model
+
+Confidence-vector convergence is **driven by the model's self-reported
+confidence**, and a non-calibrated model can game it. Concretely: small
+instruction-tuned models (e.g. `gemma-4-e4b`) frequently self-report
+`confidence ≈ 1.0`, so `quality_converged` fires on tick 1 via the
+`mean_confidence >= min_mean_confidence` branch — and the mesh stabilizes
+**before any lateral exchange happens**. In that regime the lateral-voting
+mechanism (the system's headline feature) is effectively dead code, and the
+`accepted`/`rejected` split, `mean_confidence`, and `stabilized` are all
+non-informative.
+
+Mitigations:
+
+- `ConvergenceCriteria.min_ticks` (default `1`) forces at least `min_ticks`
+  ticks before convergence is considered, guaranteeing lateral exchange runs.
+  `min_ticks >= 2` is recommended for mechanism-measurement / benchmark runs.
+- A production default change to `min_ticks >= 2` (or a non-self-reported
+  convergence signal) is **pending evidence** from the benchmark quality pass.
+- Semantic convergence (§9.3) remains the proper long-term fix but needs an
+  embedding backend the current local server does not provide.
+
 ## Refinements over the §8 reference blueprint
 
 These are the production-quality deltas applied on top of the reference code in

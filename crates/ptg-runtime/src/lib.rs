@@ -151,6 +151,7 @@ impl CorticalMesh {
         let engine = Arc::clone(&self.engine);
         let mut previous_conf: Array1<f32> = Array1::zeros(0);
         let mut last_outputs: Vec<(String, ColumnOutputSchema)> = Vec::new();
+        let mut tick_outputs: Vec<TickOutputs> = Vec::new();
         let mut ticks_run = 0u32;
         let mut stabilized = false;
 
@@ -202,6 +203,15 @@ impl CorticalMesh {
                 return Err(err);
             }
 
+            // Capture this tick's per-column outputs BEFORE convergence can
+            // short-circuit, so every executed tick is observable downstream.
+            // This enables within-run mechanism comparisons (e.g. tick 1 with
+            // no lateral context vs tick 2 with lateral context).
+            tick_outputs.push(TickOutputs {
+                tick,
+                outputs: last_outputs.clone(),
+            });
+
             // Phase 3: convergence check. Only consider convergence once we've
             // run at least `min_ticks` ticks, so an overconfident model can't
             // short-circuit the lateral-voting mechanism on tick 1.
@@ -226,6 +236,7 @@ impl CorticalMesh {
         Ok(MeshResult {
             ticks_run,
             outputs: last_outputs,
+            tick_outputs,
             accepted_outputs,
             rejected_outputs,
             mean_confidence: mean,
@@ -250,6 +261,15 @@ impl CorticalMesh {
     }
 }
 
+/// The per-column outputs captured at a single executed tick.
+#[derive(Debug, Clone)]
+pub struct TickOutputs {
+    /// 1-indexed tick number this snapshot is from.
+    pub tick: u32,
+    /// Per-column outputs at this tick (all columns, sorted-id order).
+    pub outputs: Vec<(String, ColumnOutputSchema)>,
+}
+
 /// Result of one completed epoch.
 #[derive(Debug, Clone)]
 pub struct MeshResult {
@@ -257,6 +277,10 @@ pub struct MeshResult {
     pub ticks_run: u32,
     /// Final per-column outputs from the last executed tick (all columns).
     pub outputs: Vec<(String, ColumnOutputSchema)>,
+    /// Snapshot of per-column outputs at every executed tick (tick 1..ticks_run),
+    /// in execution order. Enables within-run comparisons (e.g. tick 1 with no
+    /// lateral context vs tick 2 with lateral context).
+    pub tick_outputs: Vec<TickOutputs>,
     /// Outputs whose confidence met the integration threshold (§6 Phase 3).
     pub accepted_outputs: Vec<(String, ColumnOutputSchema)>,
     /// Outputs filtered out of the global percept for low confidence.

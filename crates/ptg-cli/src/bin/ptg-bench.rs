@@ -31,7 +31,7 @@ use ptg_core::{
     ColumnOutputSchema, Stimulus, PROMPT_CODING, PROMPT_MATHEMATICS, PROMPT_PHYSICS,
     PROMPT_PSYCHOLOGY,
 };
-use ptg_runtime::default_mesh;
+use ptg_runtime::{default_mesh, TickOutputs};
 use ptg_vllm::{CollectorSink, EngineCallMetrics, InferenceEngine, MetricsSink};
 use serde::Serialize;
 
@@ -163,10 +163,16 @@ struct AnswerRunRecord {
     error: Option<String>,
     per_call: Vec<EngineCallMetrics>,
     /// Canonical representation of the generator's raw outputs (unfiltered).
-    /// - mesh: array of `{column_id, sphere, schema}` for ALL columns.
+    /// - mesh: array of `{column_id, sphere, accepted, schema}` for ALL columns
+    ///   at the FINAL tick.
     /// - mono_all_prompts: the raw content string.
     /// - mono_x4: array of the 4 raw content strings.
     outputs: serde_json::Value,
+    /// Per-tick snapshots for mesh-style conditions (tick 1..ticks_run), each a
+    /// JSON array of canonical columns. `None` for monolithic conditions.
+    /// Enables the within-run mechanism comparison: tick 1 (no lateral context)
+    /// vs tick 2 (lateral context injected).
+    tick_outputs: Option<Vec<serde_json::Value>>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -308,6 +314,14 @@ async fn run_bench(
             let rot = (repeat as usize + pidx) % order.len().max(1);
             order.rotate_left(rot);
             for cond in order {
+                // NOTE: the nonce is deliberately CONDITION-INDEPENDENT (it
+                // depends only on seed+repeat+prompt, not on the condition). At
+                // temperature 0 this makes `mesh_adaptive`'s tick-1 column calls
+                // BYTE-IDENTICAL to `sphere_x4_no_lateral`'s calls for the same
+                // column (same system prompt, nonce, task, empty lateral context).
+                // That identity is load-bearing: it means a quality delta between
+                // mesh-tick-2 and sphere is attributable to the lateral context.
+                // Do NOT add the condition (or finer granularity) to the nonce.
                 let nonce = args
                     .seed
                     .saturating_mul(1_000_000)
@@ -391,6 +405,7 @@ async fn run_one(
         error: None,
         per_call: Vec::new(),
         outputs: serde_json::Value::Null,
+        tick_outputs: None,
     };
 
     // The nonce sits AFTER the static prompt prefix and BEFORE the task, so the
@@ -420,6 +435,7 @@ async fn run_one(
             rec.accepted_count = extras.accepted_count;
             rec.rejected_count = extras.rejected_count;
             rec.integration_threshold = extras.integration_threshold;
+            rec.tick_outputs = extras.tick_outputs;
             rec.parse_ok = true;
         }
         Err(msg) => {
@@ -439,6 +455,8 @@ struct MeshExtras {
     rejected_count: Option<u32>,
     /// Integration threshold used for the accepted/rejected split (C4 ablation).
     integration_threshold: Option<f32>,
+    /// Per-tick canonical output snapshots (tick 1..ticks_run). `None` for mono.
+    tick_outputs: Option<Vec<serde_json::Value>>,
 }
 
 async fn run_mesh(
@@ -456,6 +474,7 @@ async fn run_mesh(
         .iter()
         .map(|(id, schema)| canonical_column(id, schema, threshold))
         .collect();
+    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold));
     let extras = MeshExtras {
         ticks_run: Some(result.ticks_run),
         stabilized: Some(result.stabilized),
@@ -463,6 +482,7 @@ async fn run_mesh(
         accepted_count: Some(result.accepted_outputs.len() as u32),
         rejected_count: Some(result.rejected_outputs.len() as u32),
         integration_threshold: Some(threshold),
+        tick_outputs,
     };
     Ok((serde_json::Value::Array(outputs), extras))
 }
@@ -485,6 +505,7 @@ async fn run_mesh_one_tick(
         .iter()
         .map(|(id, schema)| canonical_column(id, schema, threshold))
         .collect();
+    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold));
     let extras = MeshExtras {
         ticks_run: Some(result.ticks_run),
         stabilized: Some(result.stabilized),
@@ -492,6 +513,7 @@ async fn run_mesh_one_tick(
         accepted_count: Some(result.accepted_outputs.len() as u32),
         rejected_count: Some(result.rejected_outputs.len() as u32),
         integration_threshold: Some(threshold),
+        tick_outputs,
     };
     Ok((serde_json::Value::Array(outputs), extras))
 }
@@ -540,6 +562,24 @@ fn canonical_column(id: &str, schema: &ColumnOutputSchema, threshold: f32) -> se
         "accepted": schema.confidence >= threshold,
         "schema": schema,
     })
+}
+
+/// Canonicalize every executed tick's outputs into a JSON array, one entry per
+/// tick, in execution order. Each entry is `{tick, outputs: [canonical_column...]}`.
+/// This gives downstream analysis the within-run mechanism signal: tick 1 (no
+/// lateral context) vs tick 2 (lateral context injected).
+fn canonical_ticks(ticks: &[TickOutputs], threshold: f32) -> Vec<serde_json::Value> {
+    ticks
+        .iter()
+        .map(|t| {
+            let cols: Vec<serde_json::Value> = t
+                .outputs
+                .iter()
+                .map(|(id, schema)| canonical_column(id, schema, threshold))
+                .collect();
+            serde_json::json!({ "tick": t.tick, "outputs": cols })
+        })
+        .collect()
 }
 
 /// Map a column's output to its perspective label, derived from which sphere-

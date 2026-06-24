@@ -88,7 +88,13 @@ Identical across all conditions:
 - Per-column completion cap for the mesh (`--max-tokens-col`, default 1024);
   the monolithic cap is `--max-tokens-mono` (default `--max-tokens-col × 2`) and
   must fit the server's `-c 4096` context. Any `finish_reason == "length"`
-  truncation is **flagged as a scored failure** on both sides.
+  truncation is **flagged as a scored failure** on both sides. **Survivorship
+  caveat:** the mesh is fail-fast, and `mesh_adaptive` (8 calls) is ~2× more
+  likely to hit a truncation than `sphere_x4_no_lateral` (4 calls), so
+  truncation-failed runs are **excluded from quality comparison** and the
+  per-condition truncation-*survival* rate is reported alongside quality. v0 does
+  NOT retry on truncation (that would mask a real budget failure); if failures
+  return at scale, raise the cap or revisit per-sphere caps.
 - **Forced minimum ticks for the mesh** (`--min-ticks`, default 2). Because an
   overconfident model can self-report `mean_confidence ≥ min_mean_confidence` on
   tick 1 — converging before any lateral exchange — the benchmark forces
@@ -163,12 +169,22 @@ Comparisons are deliberately separated into three questions:
    comparison is `mesh_adaptive` at `ticks_run ≥ 2` (lateral context is non-empty)
    vs `sphere_x4_no_lateral`. Note: a `mesh_adaptive` run that stops at tick 1 is
    **identical** to `sphere_x4_no_lateral` (same calls, no lateral context) and
-   carries NO mechanism signal — so this comparison is only valid for runs that
-   reach tick ≥ 2, and it is **inherently compute-asymmetric** (8 calls vs 4):
-   report quality normalized by call count, never as a raw win. A future
-   `sphere_x8_no_lateral` control (each sphere called twice independently, no
-   voting) would make the mechanism comparison equal-call-count; it is on the
-   roadmap for the scaled run.
+   carries NO mechanism signal. **Separate two distinct attributions:**
+   - **Quality attribution is CLEAN at `temperature: 0`.** The run nonce is
+     condition-independent, so a mesh column's tick-1 call is byte-identical to
+     that column's `sphere_x4_no_lateral` call; tick 2 differs *only* by the
+     injected lateral string. A judge-quality delta between mesh-final and
+     sphere is therefore strongly attributable to the lateral context. The even
+     cleaner signal is the **within-run paired delta**: tick 1 (no lateral) vs
+     tick 2 (lateral), both captured per run in `tick_outputs`.
+   - **Cost-efficiency attribution is CONFOUNDED.** The mesh spends 8 calls
+     (ticks ≥ 2) vs the control's 4. Quality-per-call normalization assumes
+     linear quality scaling with calls, which is not guaranteed; a 2×-compute
+     mesh that wins quality-per-call is still ambiguous (lateral mechanism, or
+     just "a second look"?). No cost-efficiency claim until the equal-call
+     ablation lands. A future `sphere_x8_no_lateral` control (each sphere called
+     twice independently, no voting) would make the mechanism comparison
+     equal-call-count; it is on the roadmap for the scaled run.
 3. All quality comparisons are **blind-judge**, normalized by total inference
    tokens and call count.
 

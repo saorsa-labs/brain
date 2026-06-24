@@ -224,7 +224,7 @@ Rather than a global cross-bar switch, columns communicate through a constrained
    Neighbor CC_PHYSICS_01 reports: Prediction="Kinetic energy threshold exceeded", Confidence=0.92
    Using this information, adjust your reference frame, resolve conflicting data, and update your prediction.
    ```
-3. Execution: This composite prompt is sent to vLLM. The loop runs for a fixed number of iterations (typically 3-5 ticks) until confidence levels stabilize.
+3. Execution: This composite prompt is sent to vLLM. The loop runs for a fixed number of iterations (typically 3-5 ticks) until confidence levels stabilize. **Known limitation:** confidence stabilization is driven by the model's *self-reported* confidence, which an overconfident model can game — causing early convergence on tick 1 before lateral exchange occurs. `ConvergenceCriteria.min_ticks` (default `1`, set `>= 2` for mechanism measurement) forces lateral exchange to run regardless. See `docs/ARCHITECTURE.md` ("Known limitation: confidence convergence assumes a calibrated model").
 
 #### Phase 3: Global Integration
 Once the consensus loop finishes, a dedicated, low-overhead Integration Layer evaluates the outputs. It aggregates the final predictions, filters out any columns with low confidence scores, and produces a cohesive global output that balances the different perspectives of the individual columns.
