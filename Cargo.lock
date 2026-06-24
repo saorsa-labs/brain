@@ -834,6 +834,7 @@ dependencies = [
  "ptg-core",
  "ptg-runtime",
  "ptg-vllm",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
