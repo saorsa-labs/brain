@@ -122,6 +122,45 @@ Degeneracy guardrails reject parameters where distinct topologies collapse to
 the same graph (e.g. `ring-bi` with < 4 columns == `fully-connected`; `small-
 world` with `degree*2 >= columns` silently under-rewires).
 
+## Early research signal: lateral consensus can homogenize frames
+
+> ⚠️ **This is a pilot observation from a single live QAT run (9-column torus,
+> `abstraction-ladder-9.toml`), not a benchmarked result.** Treat it as a
+> research direction worth investigating, not a confirmed claim. Full
+> methodology and confound analysis live in [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
+
+Three end-to-end runs against the live Gemma 4 QAT server surfaced a shared,
+unexpected theme: **lateral consensus is a homogenizing force.** The mesh tends
+to converge toward the dominant interpretation rather than preserving
+minority or niche frames.
+
+| Observation | What happened | Status |
+|-------------|---------------|--------|
+| **Confidence stratifies by abstraction level** | On a causal prompt, high-level (whole-system) columns reported mean confidence ~0.92 while low-level (token/sequence) columns reported ~0.68 — and produced more coherent causal narratives. | Confirmed on this run |
+| **Low-level drift, but no divergence** | On deliberately ambiguous token-sequence input, low-level columns latched onto literal token prediction ("the next token is likely…"), but lateral exchange pulled them back toward the high-level physics framing instead of letting the mesh fragment. | Nuanced |
+| **Topology changes propagation speed** | The niche "context" column's framing propagated rapidly across a 4-neighbor torus (0.98 conf, system-failure language adopted by neighbors) but stayed isolated in its own frame on a 1-neighbor ring (0.85 conf). | Confirmed on this run |
+
+### Open research questions
+
+This signal points at a central tension in the Thousand-Brains model that is
+worth digging into:
+
+- **When does lateral consensus improve perception vs. erase useful minority
+  frames?** Homogenization is great when the dominant frame is correct; it is a
+  failure mode when the dissenting/niche view is the one that matters.
+- **How do topology, confidence thresholds, and `--min-ticks` modulate
+  homogenization?** Ring vs torus already shows a large effect; degree and
+  rewiring probability are untested.
+- **Can weighted/attention-based routing (§9.1, deferred) preserve dissenting
+  useful frames** instead of majority-voting them away?
+- **Is the confidence stratification by abstraction level a calibration artifact**
+  (high-level columns may simply self-report higher confidence) or a real
+  cognitive signal? The judge harness (`ptg-judge`) is designed to separate
+  these, but the scaled run (A3) has not been executed.
+
+See the [roadmap](docs/ROADMAP.md) for the planned A3 scaled benchmark that
+would turn this pilot signal into evidence.
+
 ## Status
 
 Phases 0–2 are complete and panic-free. The workspace implements the domain
