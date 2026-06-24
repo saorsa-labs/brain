@@ -132,6 +132,30 @@ the prose mentions "weight voting", §9.1 itself defers dynamic, attention-
 weighted routing to future work — so unweighted topology is correct for V1 and
 weighted edges stay on the [roadmap](./ROADMAP.md).
 
+## Pluggable topologies (Phase 3)
+
+Topologies are now **pluggable** (§3.1.3). `TopologySpec`
+(`crates/ptg-core/src/topology.rs`) declares the graph as a pure function over
+an ordered `N`-column id list — `Ring`, `Torus2d`, `FullyConnected`,
+`SmallWorld`, or `Custom` — and `connections_for(&ids)` materializes it into a
+`Vec<LateralConnection>`. The runtime builds a mesh from columns plus a
+topology via `mesh_with_topology`, or from an explicit edge list via
+`mesh_from_columns`. The named 4-column reference topology (`default_mesh`) is
+**unchanged** and remains the benchmark baseline.
+
+**Direction convention (load-bearing).** Edges are `listener → source`: the
+listener receives the source's prediction. This matches
+`establish_lateral_connection(from = listener, to = source)` and
+`lateral_context_for(listener)`. Field names are `listener_id` / `source_id`
+(not `from` / `to`) precisely to prevent an analysis tool from comparing a
+column's output against the wrong end of an edge (a class of bug caught in the
+A2 judge review).
+
+**Determinism.** `SmallWorld` is reproducible given its `seed` (zero-
+dependency splitmix64 PRNG), so benchmark runs over different topologies are
+comparable without confounding randomness. Weighted/attention routing (§9.1)
+and semantic-embedding convergence (§9.3) remain deferred/blocked.
+
 ## Security posture (Phase 2 review)
 
 `ptg` is a single-user local dev CLI talking to a **trusted** local inference

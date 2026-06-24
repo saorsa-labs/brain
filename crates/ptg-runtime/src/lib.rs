@@ -18,7 +18,9 @@ use std::sync::Arc;
 use futures::future::join_all;
 use ndarray::Array1;
 use ptg_consensus::{confidence_vector, mean_confidence, quality_converged, ConvergenceCriteria};
-use ptg_core::{ColumnOutputSchema, CorticalColumn, Stimulus};
+use ptg_core::{
+    ColumnOutputSchema, CorticalColumn, LateralConnection, Stimulus, TopologyError, TopologySpec,
+};
 use ptg_vllm::{ColumnEngine, EngineError};
 
 /// Errors raised by mesh construction or execution.
@@ -37,6 +39,9 @@ pub enum MeshError {
         #[source]
         source: EngineError,
     },
+    /// A topology could not be materialized against the supplied columns.
+    #[error("topology error: {0}")]
+    Topology(#[from] TopologyError),
 }
 
 /// The orchestrator tracking column population and topology (§3.1.3, §8.2).
@@ -307,6 +312,48 @@ pub fn default_mesh(engine: Arc<dyn ColumnEngine>) -> Result<CorticalMesh, MeshE
     Ok(mesh)
 }
 
+/// Build a mesh from an explicit column population and a caller-supplied edge
+/// list. Each `LateralConnection` says the `listener_id` receives the
+/// `source_id`'s prediction (see `establish_lateral_connection`). Column ids in
+/// the edge list must already have been added via the `columns` slice; unknown
+/// ids surface as [`MeshError::UnknownColumn`].
+///
+/// # Errors
+/// [`MeshError::UnknownColumn`] if an edge references an id not in `columns`.
+pub fn mesh_from_columns(
+    engine: Arc<dyn ColumnEngine>,
+    columns: Vec<CorticalColumn>,
+    connections: impl IntoIterator<Item = LateralConnection>,
+) -> Result<CorticalMesh, MeshError> {
+    let mut mesh = CorticalMesh::new(engine);
+    for col in columns {
+        mesh.add_column(col)?;
+    }
+    for conn in connections {
+        mesh.establish_lateral_connection(&conn.listener_id, &conn.source_id)?;
+    }
+    Ok(mesh)
+}
+
+/// Build a mesh from an explicit column population and a declarative topology.
+/// The topology is materialized against the ordered column-id list (taken from
+/// `columns` in iteration order), so positional variants (ring/torus/small-
+/// world) map onto the columns positionally. This is the primary Phase 3 entry
+/// point for pluggable topologies (§3.1.3).
+///
+/// # Errors
+/// [`MeshError::Topology`] if the topology does not fit the column count, or
+/// [`MeshError::UnknownColumn`] on an internal id mismatch.
+pub fn mesh_with_topology(
+    engine: Arc<dyn ColumnEngine>,
+    columns: Vec<CorticalColumn>,
+    topology: &TopologySpec,
+) -> Result<CorticalMesh, MeshError> {
+    let ids: Vec<String> = columns.iter().map(|c| c.id.clone()).collect();
+    let connections = topology.connections_for(&ids)?;
+    mesh_from_columns(engine, columns, connections)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +482,108 @@ mod tests {
             assert!((0.0..=1.0).contains(&out.confidence));
         }
         Ok(())
+    }
+
+    fn source_ids(mesh: &CorticalMesh, id: &str) -> Result<Vec<String>, MeshError> {
+        Ok(mesh.get_neighbors(id)?.into_iter().map(|c| c.id).collect())
+    }
+
+    #[test]
+    fn default_mesh_wiring_is_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+        // Regression guard: the named 4-column topology must keep its
+        // hand-coded edges (PHYSICS listens to MATH; MATH to PHYSICS+CODE;
+        // CODE to PSYCH; PSYCH to none — the graph sink).
+        let mesh = default_mesh(Arc::new(LowConfEngine))?;
+        let mut phys = source_ids(&mesh, "CC_PHYSICS_01")?;
+        phys.sort();
+        assert_eq!(phys, vec!["CC_MATH_01"]);
+        let mut math = source_ids(&mesh, "CC_MATH_01")?;
+        math.sort();
+        assert_eq!(math, vec!["CC_CODE_01", "CC_PHYSICS_01"]);
+        let code = source_ids(&mesh, "CC_CODE_01")?;
+        assert_eq!(code, vec!["CC_PSYCH_01"]);
+        let psych = source_ids(&mesh, "CC_PSYCH_01")?;
+        assert!(psych.is_empty(), "PSYCH is the graph sink");
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_from_columns_wires_explicit_edges() -> Result<(), Box<dyn std::error::Error>> {
+        let cols = ptg_core::replicated_default_columns(3);
+        let conns = vec![
+            LateralConnection::new("CC_PHYSICS_01", "CC_MATH_01"),
+            LateralConnection::new("CC_PHYSICS_01", "CC_CODE_01"),
+        ];
+        let mesh = mesh_from_columns(Arc::new(LowConfEngine), cols, conns)?;
+        let mut s = source_ids(&mesh, "CC_PHYSICS_01")?;
+        s.sort();
+        assert_eq!(s, vec!["CC_CODE_01", "CC_MATH_01"]);
+        assert!(source_ids(&mesh, "CC_MATH_01")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_with_topology_ring_wires_predecessor() -> Result<(), Box<dyn std::error::Error>> {
+        // 5 columns round-robin; unidirectional ring → each listens to its
+        // predecessor in id order.
+        let cols = ptg_core::replicated_default_columns(5);
+        let ids: Vec<String> = cols.iter().map(|c| c.id.clone()).collect();
+        let mesh = mesh_with_topology(
+            Arc::new(LowConfEngine),
+            cols,
+            &TopologySpec::Ring {
+                bidirectional: false,
+            },
+        )?;
+        assert_eq!(source_ids(&mesh, &ids[0])?, vec![ids[4].clone()]);
+        assert_eq!(source_ids(&mesh, &ids[1])?, vec![ids[0].clone()]);
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_with_topology_torus_gives_four_neighbors() -> Result<(), Box<dyn std::error::Error>> {
+        let cols = ptg_core::replicated_default_columns(9);
+        let mesh = mesh_with_topology(
+            Arc::new(LowConfEngine),
+            cols,
+            &TopologySpec::Torus2d {
+                width: 3,
+                height: 3,
+            },
+        )?;
+        for col in mesh.columns.values() {
+            assert_eq!(
+                source_ids(&mesh, &col.id)?.len(),
+                4,
+                "every torus node has four cardinal sources"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_with_topology_fully_connected() -> Result<(), Box<dyn std::error::Error>> {
+        let cols = ptg_core::replicated_default_columns(4);
+        let mesh =
+            mesh_with_topology(Arc::new(LowConfEngine), cols, &TopologySpec::FullyConnected)?;
+        for col in mesh.columns.values() {
+            assert_eq!(source_ids(&mesh, &col.id)?.len(), 3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_with_topology_propagates_geometry_error() {
+        // 8 columns cannot form a 3x3 torus.
+        let cols = ptg_core::replicated_default_columns(8);
+        let res = mesh_with_topology(
+            Arc::new(LowConfEngine),
+            cols,
+            &TopologySpec::Torus2d {
+                width: 3,
+                height: 3,
+            },
+        );
+        assert!(matches!(res, Err(MeshError::Topology(_))));
     }
 }

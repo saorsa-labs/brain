@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+mod topology;
+pub use topology::{LateralConnection, TopologyError, TopologySpec};
+
 // ---------------------------------------------------------------------------
 // System prompts (§5 "Column Prompt Blueprint")
 // ---------------------------------------------------------------------------
@@ -425,6 +428,31 @@ pub fn default_connections() -> Vec<(&'static str, &'static str)> {
         ("CC_MATH_01", "CC_CODE_01"),
         ("CC_CODE_01", "CC_PSYCH_01"),
     ]
+}
+
+/// Build `n` columns by round-robin replication of the four domain spheres, so
+/// a topology can be materialized over an arbitrarily large node set without a
+/// new sphere type. Ids are `CC_<SPHERE>_<NN>` (e.g. `CC_PHYSICS_01`). The
+/// topology is kept independent of column content: callers pass the resulting
+/// list to `TopologySpec::connections_for` in the same order.
+#[must_use]
+pub fn replicated_default_columns(n: usize) -> Vec<CorticalColumn> {
+    let spheres = [
+        DomainSphere::Physics,
+        DomainSphere::Mathematics,
+        DomainSphere::Coding,
+        DomainSphere::Psychology,
+    ];
+    let shorts = ["PHYSICS", "MATH", "CODE", "PSYCH"];
+    let mut counts = [0_usize; 4];
+    (0..n)
+        .map(|i| {
+            let k = i % spheres.len();
+            counts[k] += 1;
+            let id = format!("CC_{}_{:02}", shorts[k], counts[k]);
+            CorticalColumn::with_defaults(&id, spheres[k])
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -88,6 +88,18 @@ A highly optimized, thread-safe Rust structure representing a single functional 
 #### 3.1.3 The Lateral Mesh (CorticalMesh)
 The orchestrator tracking architectural topology. The mesh dictates column interconnectivity (e.g., Ring, Torus, fully-connected sub-graphs, or Small-World Networks). It manages execution barriers and directs how data flows between adjacent columns during the voting phase.
 
+**Direction convention (load-bearing).** Every lateral edge is expressed as `listener → source`: the *listener* column receives the *source* column's prediction on every tick after the first. This matches `CorticalMesh::establish_lateral_connection(from = listener, to = source)` and `lateral_context_for(listener)`, which reads the sources stored under `adjacency_list[listener]`. Naming the endpoints `listener`/`source` (rather than `from`/`to`) makes the data-flow direction unambiguous and prevents the class of bug where a screen compares a column against the wrong end of an edge.
+
+**Pluggable topologies (Phase 3).** Topologies are pure graph functions over an ordered `N`-column id list, declared as `TopologySpec` (`crates/ptg-core/src/topology.rs`) and materialized with `connections_for(&[ids]) -> Vec<LateralConnection>`:
+
+- `Ring { bidirectional }` — 1-D cycle; each column listens to its predecessor (and successor when bidirectional). Requires ≥ 2 columns.
+- `Torus2d { width, height }` — 2-D wraparound grid; each column listens to its four cardinal neighbors. Requires `width × height` columns and both dimensions ≥ 3.
+- `FullyConnected` — every column listens to every other (`n·(n−1)` edges).
+- `SmallWorld { degree, rewire_probability, seed }` — directed Watts-Strogatz from a ring lattice of `degree` nearest neighbors, each edge rewired with probability `rewire_probability`. **Deterministic given `seed`** (zero-dependency splitmix64 PRNG). Requires an even `degree` with `0 < degree < n`.
+- `Custom(Vec<LateralConnection>)` — caller-supplied edge list, validated for self-edges, duplicates, and unknown ids.
+
+A mesh is built from a column population plus a topology via `mesh_with_topology(engine, columns, &topology)` or from an explicit edge list via `mesh_from_columns(engine, columns, connections)` (`crates/ptg-runtime`). The named 4-column reference topology (`default_mesh`) is preserved unchanged for backward compatibility and the benchmark baseline.
+
 ---
 
 ## 4. Rust Technical Stack & Dependencies

@@ -61,14 +61,18 @@ compute-matched controls pass review. No headline quality claim until then.
 - [ ] Pilot run against `gemma-4-e4b`; record results (pilot-only, no headline).
 - [ ] Scale to ~50+ prompts + paired statistics if pilot is sound.
 
-## Phase 3 — Topologies & convergence depth (next)
+## Phase 3 — Topologies & convergence depth (in progress)
 
-- [ ] Pluggable topologies: ring, torus, small-world (§3.1.3).
+- [~] Pluggable topologies: ring, torus, small-world (§3.1.3). **Library +
+      runtime landed** (`ptg-core::TopologySpec`, `ptg-runtime::mesh_with_topology`);
+      CLI/bench `--topology` flags deferred until a topology-aware benchmark is wired.
 - [ ] Weighted / attention-routed lateral connections (§9.1 "Dynamic Topology
       Scaling") — columns choose which neighbors to listen to.
 - [ ] Full **semantic** cosine convergence over prediction embeddings (§9.3),
-      requiring an embedding backend.
-- [ ] Early-stop similarity checks between iterations.
+      requiring an embedding backend (blocked: live server returns HTTP 501 on
+      `/v1/embeddings`).
+- [ ] Early-stop similarity checks between iterations (cheap string proxy as a
+      `ConvergenceCriteria` field — unblocked, not yet built).
 
 ## Phase 4 — Scale & observability
 
