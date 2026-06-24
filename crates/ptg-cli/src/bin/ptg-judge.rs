@@ -455,7 +455,7 @@ fn confidence_delta(c1: &CanonicalColumn, c2: &CanonicalColumn) -> Option<f64> {
 
 /// Crude echo screen: flag if tick-2's prediction shares a long token run with
 /// tick-1's prediction beyond what's expected from the shared task (heuristic:
-/// a 30+ char substring of tick-1's prediction appearing in tick-2's is treated
+/// a 40+ char substring of tick-1's prediction appearing in tick-2's is treated
 /// as a potential lateral echo). This is intentionally conservative.
 fn echo_screen(c2: &CanonicalColumn, c1: &CanonicalColumn) -> bool {
     let Some(p1) = c1.schema.get("prediction").and_then(Value::as_str) else {
@@ -821,15 +821,35 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
     let mut s = String::new();
     s.push_str("# PTG Benchmark — A2 judge report\n\n");
     s.push_str(
-        "> **A2 scope: mechanism ACTIVATION, not consensus benefit.** The primary signal is the\n",
+        "> **A2 scope: mechanism ACTIVATION ONLY — not consensus, not improvement, not calibration.**\n",
     );
     s.push_str(
-        "> programmatic perturbation delta (did lateral context make the column move?); the LLM\n",
+        "> This report answers only: *did the lateral context injected on tick 2 make the\n",
     );
     s.push_str(
-        "> judge is a corroborating signal only. 'Improvement' is bounded by the missing A3\n",
+        "> receiving columns MOVE?* It does NOT show the mesh reaches consensus, that lateral\n",
     );
-    s.push_str("> no-lateral-second-tick control. See `docs/BENCHMARKING.md`.\n\n");
+    s.push_str(
+        "> context IMPROVES outputs, or anything about quality. See `docs/BENCHMARKING.md`.\n\n",
+    );
+    s.push_str("### How NOT to read this report\n\n");
+    s.push_str(
+        "- **Edit distance is NOT quality.** A 0.75 perturbation means the output CHANGED a lot,\n",
+    );
+    s.push_str("  not that it got better. A column can change a lot and get worse.\n");
+    s.push_str(
+        "- **LLM winner counts are NOT the headline and are NOT a quality verdict.** They are\n",
+    );
+    s.push_str(
+        "  directional noise from a corroborating signal; do not cite them as proof of anything.\n",
+    );
+    s.push_str("- **`determinism_ok` checks only `CC_PSYCH_01` per run** (it has no lateral inputs); it does\n");
+    s.push_str("  NOT prove cross-run determinism for the receiving columns.\n");
+    s.push_str("- **`confidence_delta` is self-reported → NON-evidence** for quality or calibration; near-zero\n");
+    s.push_str("  may reflect overconfidence ceiling effect, not good calibration.\n");
+    s.push_str(
+        "- **Echo exclusion is a crude 40-char heuristic;** survivors may still be de-blinded.\n\n",
+    );
     s.push_str(&format!("- Input: `{}`\n", args.input.display()));
     s.push_str(&format!("- Pairs analyzed: {}\n", pairs.len()));
     let excluded = pairs.iter().filter(|p| p.excluded).count();
@@ -849,6 +869,13 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
         for (k, v) in &exc {
             s.push_str(&format!("- {k}: {v}\n"));
         }
+        s.push_str(
+            "\n> Echo (`tick2_echoed_neighbor`) exclusion is a conservative 40-char-substring heuristic;\n",
+        );
+        s.push_str(
+            "> it catches verbatim neighbor-text leaks only. A nonzero count here signals non-trivial\n",
+        );
+        s.push_str("> leakage risk, and survivors may still be de-blinded by paraphrase.\n");
     }
 
     // PRIMARY: programmatic perturbation delta (non-excluded pairs only).
@@ -859,8 +886,15 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
         "> column's output at all?\" Normalized edit distance on `prediction`; domain-field\n",
     );
     s.push_str(
-        "> change rate. A nonzero delta = activation; its size is the perturbation magnitude.\n\n",
+        "> change rate. A nonzero delta = activation; its size is the perturbation magnitude.\n",
     );
+    s.push_str(
+        "> **⚠️ Edit distance = perturbation magnitude, NOT quality.** A column can change a lot\n",
+    );
+    s.push_str(
+        "> and get worse. domain-field change counts CHANGED KEYS, not correctness; `—` = no\n",
+    );
+    s.push_str("> comparable fields.\n\n");
     if scored.is_empty() {
         s.push_str("(no non-excluded pairs)\n");
     } else {
@@ -920,6 +954,7 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
     if judged.is_empty() {
         s.push_str("(LLM judge not run — pass `--judge` with `PTG_JUDGE_API_KEY` set)\n");
     } else {
+        s.push_str("**⚠️ NOT the primary result. Directional noise only — do not cite as a quality verdict.**\n\n");
         s.push_str(&format!(
             "- judge model: `{}` via `{}`\n",
             args.judge_model, args.judge_api_url
@@ -947,9 +982,11 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
     }
 
     s.push_str("\n## Honest bounds\n\n");
-    s.push_str("- n per column is tiny; no statistical claim from a pilot.\n");
-    s.push_str("- 3 columns is the generalization ceiling (lateral helps *these domains*, not 'columns' in general).\n");
-    s.push_str("- `confidence_delta` is self-reported → NON-evidence for quality.\n");
+    s.push_str(&format!("- n per column is tiny ({} judged pairs total); any LLM winner split is within swap-disagreement noise — no statistical claim.\n", judged.len()));
+    s.push_str("- 3 columns is the generalization ceiling (lateral activates *these domains*, not 'columns' in general).\n");
+    s.push_str("- `confidence_delta` is self-reported → NON-evidence for quality or calibration (near-zero may be overconfidence ceiling).\n");
+    s.push_str("- `determinism_ok` is per-run, `CC_PSYCH_01`-only; it does NOT establish cross-run determinism for the receiving columns.\n");
+    s.push_str("- Echo-exclusion survivors may still be de-blinded by paraphrase; the survivor set may be biased toward columns that ignored lateral context.\n");
     s.push_str("- A clean 'lateral IMPROVES' claim requires the A3 no-lateral-second-tick control (not yet built).\n");
     s
 }
