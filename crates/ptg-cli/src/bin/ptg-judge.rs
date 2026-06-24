@@ -44,6 +44,29 @@ const LATERAL_RECEIVERS: &[&str] = &["CC_PHYSICS_01", "CC_MATH_01", "CC_CODE_01"
 /// The graph sink — no incoming lateral edges → free determinism gate.
 const DETERMINISM_COLUMN: &str = "CC_PSYCH_01";
 
+/// Default-topology listener→sources map. An edge `(from, to)` in
+/// `ptg_core::default_connections` means `from` LISTENS TO `to` (it receives
+/// `to`'s prediction), because `establish_lateral_connection` appends `to` to
+/// `adjacency_list[from]` and `lateral_context_for(id)` reads `adjacency_list[id]`.
+/// These are therefore the columns whose tick-1 predictions get injected into
+/// each receiver on tick 2 — exactly what the echo-screen must check against.
+fn listener_sources() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        ("CC_PHYSICS_01", &["CC_MATH_01"]),
+        ("CC_MATH_01", &["CC_PHYSICS_01", "CC_CODE_01"]),
+        ("CC_CODE_01", &["CC_PSYCH_01"]),
+    ]
+}
+
+/// The sources a given receiver listens to in the default topology, or empty.
+fn sources_for(receiver: &str) -> &'static [&'static str] {
+    listener_sources()
+        .iter()
+        .find(|(r, _)| *r == receiver)
+        .map(|(_, s)| *s)
+        .unwrap_or(&[])
+}
+
 #[derive(Parser)]
 #[command(
     name = "ptg-judge",
@@ -279,9 +302,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (Some(c1), Some(c2)) = (t1_map.get(col_id), t2_map.get(col_id)) else {
                 continue;
             };
-            // Echo screen: does tick-2's prediction contain a neighbor-token leak?
-            // (Neighbor predictions are injected verbatim; a literal echo de-blinds.)
-            let echoed = c2.lateral_active && echo_screen(c2, c1);
+            // Echo screen against the ACTUAL injected neighbor (source) text, not
+            // the receiver's own tick-1. Gather each source's tick-1 prediction.
+            let source_preds: Vec<&str> = sources_for(col_id)
+                .iter()
+                .filter_map(|src| t1_map.get(*src))
+                .filter_map(|c| c.schema.get("prediction").and_then(Value::as_str))
+                .collect();
+            let echoed = c2.lateral_active && echo_screen_against_sources(c2, &source_preds);
             let tick2_trunc = run.truncated;
             let mut excluded = false;
             let mut reason = None;
@@ -453,27 +481,27 @@ fn confidence_delta(c1: &CanonicalColumn, c2: &CanonicalColumn) -> Option<f64> {
     Some(b - a)
 }
 
-/// Crude echo screen: flag if tick-2's prediction shares a long token run with
-/// tick-1's prediction beyond what's expected from the shared task (heuristic:
-/// a 40+ char substring of tick-1's prediction appearing in tick-2's is treated
-/// as a potential lateral echo). This is intentionally conservative.
-fn echo_screen(c2: &CanonicalColumn, c1: &CanonicalColumn) -> bool {
-    let Some(p1) = c1.schema.get("prediction").and_then(Value::as_str) else {
-        return false;
-    };
+/// Echo screen: flag if the receiver's tick-2 `prediction` contains a long
+/// verbatim run of any of its SOURCE neighbors' tick-1 predictions. The lateral
+/// context injected on tick 2 embeds each source's prediction verbatim (see
+/// `lateral_context_for`), so a literal echo de-blinds the judge toward tick-2.
+/// NOTE: compares against the actual injected NEIGHBOR text (sources), NOT the
+/// receiver's own tick-1 (that detects self-repetition, not leakage).
+/// Heuristic and intentionally conservative: any 40-char window of a source's
+/// tick-1 prediction appearing in the receiver's tick-2 prediction.
+fn echo_screen_against_sources(c2: &CanonicalColumn, source_tick1_predictions: &[&str]) -> bool {
     let Some(p2) = c2.schema.get("prediction").and_then(Value::as_str) else {
         return false;
     };
-    // Only flag if tick-2 contains a substantial run from tick-1 that is NOT just
-    // the shared task boilerplate. We approximate: any 40-char window of p1 that
-    // appears in p2. (The injection embeds the neighbor's FULL prediction.)
-    if p1.len() < 40 {
-        return false;
-    }
-    for i in 0..p1.len().saturating_sub(40) {
-        let window = &p1[i..i + 40];
-        if p2.contains(window) {
-            return true;
+    for src in source_tick1_predictions {
+        if src.chars().count() < 40 {
+            continue;
+        }
+        for i in 0..src.len().saturating_sub(40) {
+            let window = &src[i..i + 40];
+            if p2.contains(window) {
+                return true;
+            }
         }
     }
     false
@@ -512,6 +540,7 @@ async fn run_judge_pair(
             *tb,
             idx as u32 + 1,
             &call_id,
+            &run.run_id,
             &run.prompt_id,
             run.repeat_index,
         )
@@ -566,6 +595,7 @@ async fn run_judge_pair(
             tb,
             3,
             &call_id,
+            &run.run_id,
             &run.prompt_id,
             run.repeat_index,
         )
@@ -677,6 +707,7 @@ async fn judge_once(
     tick_b: u32,
     adjudication_index: u32,
     call_id: &str,
+    run_id: &str,
     prompt_id: &str,
     repeat_index: u32,
 ) -> Result<(Verdict, u64, Option<Value>, JudgeCallRecord), String> {
@@ -730,7 +761,7 @@ async fn judge_once(
                         let record = JudgeCallRecord {
                             record_type: "judge_call",
                             judge_call_id: call_id.to_string(),
-                            run_id: String::new(), // filled by caller via run_id? — keep minimal
+                            run_id: run_id.to_string(),
                             prompt_id: prompt_id.to_string(),
                             repeat_index,
                             column_id: column_id.to_string(),
@@ -914,10 +945,11 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
                 .filter_map(|p| p.prediction_edit_distance)
                 .collect();
             ed.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let dfc: Vec<f64> = cs
+            let mut dfc: Vec<f64> = cs
                 .iter()
                 .filter_map(|p| p.domain_field_change_rate)
                 .collect();
+            dfc.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let cd: Vec<f64> = cs.iter().filter_map(|p| p.confidence_delta).collect();
             let med = |v: &[f64]| {
                 if v.is_empty() {
@@ -952,7 +984,7 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
         .collect();
     s.push_str("\n## Corroborating: LLM judge (if run)\n\n");
     if judged.is_empty() {
-        s.push_str("(LLM judge not run — pass `--judge` with `PTG_JUDGE_API_KEY` set)\n");
+        s.push_str("(LLM judge not run — pass `--judge` and set the judge API key env var (default `GROQ_API_KEY`)\n");
     } else {
         s.push_str("**⚠️ NOT the primary result. Directional noise only — do not cite as a quality verdict.**\n\n");
         s.push_str(&format!(
