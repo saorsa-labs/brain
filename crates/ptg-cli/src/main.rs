@@ -48,6 +48,16 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     min_ticks: u32,
 
+    /// Maximum output tokens per column tick (default 1024). Raise if columns
+    /// emit JSON that truncates mid-string (common at high column counts where
+    /// neighbor context lengthens the prompt).
+    #[arg(long, default_value_t = 1024)]
+    max_tokens: u32,
+
+    /// Sampling temperature (default 0.0 for deterministic output).
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f32,
+
     /// Input stimulus broadcast to all columns.
     #[arg(long, default_value = DEFAULT_INPUT)]
     input: String,
@@ -332,7 +342,10 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
         return Ok(ExitCode::SUCCESS);
     }
 
-    let engine = InferenceEngine::new(&cli.vllm_url, &cli.model)?;
+    let engine = InferenceEngine::builder(&cli.vllm_url, &cli.model)
+        .max_tokens(cli.max_tokens)
+        .temperature(cli.temperature)
+        .build()?;
 
     if cli.probe {
         let models = list_models(engine.http_client(), engine.vllm_url()).await?;
@@ -442,6 +455,8 @@ mod tests {
             model: String::new(),
             ticks: 5,
             min_ticks: 1,
+            max_tokens: 1024,
+            temperature: 0.0,
             input: String::new(),
             image_urls: Vec::new(),
             image_detail: String::from("auto"),
