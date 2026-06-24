@@ -50,11 +50,51 @@ brain/
 
 ## Getting started
 
+> **Start here:** follow [`docs/TUTORIAL.md`](docs/TUTORIAL.md) to start the
+> verified Gemma 4 QAT server, run your first cortical mesh, and edit column
+> packs for abstraction-level experiments.
+
+### Model setup (3 tiers)
+
+| Tier | Model | Memory | Notes |
+|------|-------|--------|-------|
+| **Default** | `unsloth/gemma-4-E2B-it-qat-GGUF` (QAT) | ~2.7 GB | 3× less memory, drop-in GGUF. Start here. |
+| Fallback | `ggml-org/gemma-4-E2B-it-GGUF:Q4_K_M` | ~3.5 GB | Balanced default if QAT unavailable. |
+| Scaling | TurboQuant KV-cache ([fork](https://github.com/TheTom/llama-cpp-turboquant)) | 6× KV cache | Past the memory wall; not drop-in. |
+
+```bash
+scripts/start-gemma4-qat.sh          # start the QAT model server (port 18136)
+cargo run -p ptg-cli --bin ptg -- --probe \
+    --vllm-url http://127.0.0.1:18136 --model gemma-4-e2b-qat
+
+cargo run -p ptg-cli --bin ptg -- \   # your first mesh run
+    --vllm-url http://127.0.0.1:18136 --model gemma-4-e2b-qat \
+    --topology ring --columns 4 --min-ticks 2 --max-tokens 1024 --temperature 0
+```
+
+### Column packs (abstraction-level experiments)
+
+Swap column system prompts via a TOML pack to test how a column's abstraction
+level (high-level physics vs mid-level shapes vs low-level sequences) changes
+what the mesh converges to:
+
+```bash
+# 9 columns at 3 abstraction levels on a 3×3 torus
+cargo run -p ptg-cli --bin ptg -- --dry-run \
+    --column-pack examples/column-packs/abstraction-ladder-9.toml \
+    --topology torus --torus-width 3 --torus-height 3 --columns 9
+```
+
+See [`examples/column-packs/`](examples/column-packs/) and the
+[tutorial](docs/TUTORIAL.md) §8–9 for experiment recipes.
+
+### Quick checks
+
 ```bash
 cargo check --workspace                        # type-check all crates
 cargo fmt --all                                # format
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p ptg-cli                           # run the default reference mesh
+cargo test                                     # 78 tests
 ```
 
 ### Pluggable topologies (Phase 3)
@@ -103,6 +143,7 @@ multimodal *live* validation, and benchmarks — are tracked in the
 
 ## Documentation
 
+- [Tutorial](docs/TUTORIAL.md) — **start here**: server setup, first run, column packs, experiment recipes
 - [Specification](docs/SPECIFICATION.md) — full architectural blueprint (source of truth)
 - [Architecture](docs/ARCHITECTURE.md) — crate-level design and data flow
 - [Roadmap](docs/ROADMAP.md) — implementation phases

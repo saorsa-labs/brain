@@ -4,6 +4,7 @@
 //! OpenAI-compatible server. Use `--dry-run` to validate wiring without a
 //! server, or `--probe` to test reachability without running an epoch.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -14,6 +15,8 @@ use ptg_core::{
 };
 use ptg_runtime::{default_mesh, mesh_from_columns};
 use ptg_vllm::{list_models, ColumnEngine, InferenceEngine};
+
+mod column_pack;
 
 /// Default stimulus from the reference wiring (§8.4).
 const DEFAULT_INPUT: &str = "Anomalous kinetic energy burst detected tracking at vector [4, 12, -2]. Script automation system failed initialization step.";
@@ -79,6 +82,14 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// TOML column pack defining explicit columns (id / sphere / system_prompt /
+    /// optional level). Replaces the round-robin replicated defaults for a
+    /// generated topology. With `--topology default` the pack ids must be exactly
+    /// the four named reference ids. For generated topologies the pack count
+    /// must equal `--columns` (or width*height for torus).
+    #[arg(long = "column-pack", value_name = "PATH")]
+    column_pack: Option<PathBuf>,
+
     /// Lateral mesh topology (§3.1.3). `default` is the named 4-column reference
     /// graph; the others are built over `--columns` replicated domain spheres.
     #[arg(long, value_enum, default_value_t = TopologyKind::Default)]
@@ -136,6 +147,10 @@ enum TopologyKind {
 struct MeshPlan {
     columns: Vec<CorticalColumn>,
     connections: Vec<LateralConnection>,
+    /// Optional abstraction-level tag per column (parallel to `columns`),
+    /// populated from a column pack's `level` field; empty for replicated
+    /// defaults. Surfaced in `--dry-run` for experiment attribution.
+    levels: Vec<Option<u8>>,
     label: String,
 }
 
@@ -151,6 +166,43 @@ impl TopologyKind {
             Self::SmallWorld => "small-world",
         }
     }
+}
+
+/// The four named ids of the reference 4-column mesh, in any order.
+fn expected_default_ids() -> &'static [&'static str] {
+    &["CC_PHYSICS_01", "CC_MATH_01", "CC_CODE_01", "CC_PSYCH_01"]
+}
+
+/// Validate that a pack reproduces the named reference graph (by id, order-
+/// independent) so `--topology default --column-pack` is the same wiring as
+/// `default_mesh`.
+///
+/// # Errors
+/// `Err(String)` if the pack id set is not exactly the four reference ids.
+fn validate_default_pack_ids(columns: &[CorticalColumn]) -> Result<(), String> {
+    let mut have: Vec<&str> = columns.iter().map(|c| c.id.as_str()).collect();
+    have.sort_unstable();
+    let mut want: Vec<&str> = expected_default_ids().to_vec();
+    want.sort_unstable();
+    if have == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "--topology default with --column-pack requires exactly these ids \n(order-independent): {}\n(pack has: {})",
+            expected_default_ids().join(", "),
+            columns.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
+/// The reference 4-column lateral edges as `LateralConnection`s.
+/// `default_connections()` tuples are `(listener, source)` (the listener
+/// receives the source's prediction); the conversion preserves that direction.
+fn default_reference_edges() -> Vec<LateralConnection> {
+    ptg_core::default_connections()
+        .into_iter()
+        .map(|(listener, source)| LateralConnection::new(listener, source))
+        .collect()
 }
 
 /// Resolve the column count from `--columns`, or for torus from the grid dims.
@@ -183,7 +235,23 @@ fn resolve_columns(cli: &Cli) -> Result<usize, String> {
 /// than the library minimums, to keep generated graphs meaningful).
 fn topology_plan(cli: &Cli) -> Result<Option<MeshPlan>, String> {
     if cli.topology == TopologyKind::Default {
-        return Ok(None);
+        return match &cli.column_pack {
+            None => Ok(None),
+            Some(path) => {
+                // A pack + default topology is only valid if it reproduces the
+                // named 4-column reference graph exactly (by id; order-independent).
+                let cols = column_pack::load_column_pack_with_levels(path)?;
+                let (columns, levels): (Vec<_>, Vec<_>) = cols.into_iter().unzip();
+                validate_default_pack_ids(&columns)?;
+                let connections = default_reference_edges();
+                Ok(Some(MeshPlan {
+                    columns,
+                    connections,
+                    levels,
+                    label: "default (from pack)".to_string(),
+                }))
+            }
+        };
     }
     let n = resolve_columns(cli)?;
 
@@ -214,7 +282,25 @@ fn topology_plan(cli: &Cli) -> Result<Option<MeshPlan>, String> {
         _ => {}
     }
 
-    let columns = replicated_default_columns(n);
+    let columns_levels: Vec<Option<u8>>;
+    let columns = match &cli.column_pack {
+        Some(path) => {
+            let pack = column_pack::load_column_pack_with_levels(path)?;
+            if pack.len() != n {
+                return Err(format!(
+                    "--column-pack has {} column(s) but topology expects {n} \n(derive via --columns or --torus-width/--torus-height)",
+                    pack.len()
+                ));
+            }
+            let (columns, levels): (Vec<_>, Vec<_>) = pack.into_iter().unzip();
+            columns_levels = levels;
+            columns
+        }
+        None => {
+            columns_levels = vec![None; n];
+            replicated_default_columns(n)
+        }
+    };
     let ids: Vec<String> = columns.iter().map(|c| c.id.clone()).collect();
     let (spec, label) = match cli.topology {
         TopologyKind::Default => unreachable!("handled above"),
@@ -257,6 +343,7 @@ fn topology_plan(cli: &Cli) -> Result<Option<MeshPlan>, String> {
     Ok(Some(MeshPlan {
         columns,
         connections,
+        levels: columns_levels,
         label: label.to_string(),
     }))
 }
@@ -321,8 +408,16 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
                     plan.columns.len(),
                     plan.connections.len()
                 );
-                for col in &plan.columns {
-                    println!("  column   : {} [{}]", col.id, col.sphere.as_str());
+                for (col, level) in plan.columns.iter().zip(plan.levels.iter()) {
+                    match level {
+                        Some(lv) => println!(
+                            "  column   : {} [{}] level={}",
+                            col.id,
+                            col.sphere.as_str(),
+                            lv
+                        ),
+                        None => println!("  column   : {} [{}]", col.id, col.sphere.as_str()),
+                    }
                 }
                 let mut by_listener: std::collections::BTreeMap<&str, Vec<&str>> =
                     std::collections::BTreeMap::new();
@@ -462,6 +557,7 @@ mod tests {
             image_detail: String::from("auto"),
             probe: false,
             dry_run: false,
+            column_pack: None,
             topology,
             columns,
             torus_width: None,
@@ -582,6 +678,102 @@ mod tests {
             _ => return Err("expected plans".to_string()),
         };
         assert_eq!(a_conns, b_conns);
+        Ok(())
+    }
+
+    /// Helper: write a pack to a temp file and return its path.
+    fn write_test_pack(body: &str) -> Result<PathBuf, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MAIN_PACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir();
+        let id = MAIN_PACK_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = dir.join(format!("ptg-main-pack-{id}.toml"));
+        std::fs::write(&path, body).map_err(|e| format!("write: {e}"))?;
+        Ok(path)
+    }
+
+    #[test]
+    fn column_pack_default_with_wrong_ids_is_rejected() -> Result<(), String> {
+        // Two columns but NOT the four reference ids.
+        let body = r#"
+[[columns]]
+id = "CC_X"
+sphere = "Physics"
+system_prompt = "x"
+[[columns]]
+id = "CC_Y"
+sphere = "Coding"
+system_prompt = "y"
+"#;
+        let path = write_test_pack(body)?;
+        let mut cli = test_cli(TopologyKind::Default, None);
+        cli.column_pack = Some(path.clone());
+        let res = topology_plan(&cli);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            res.is_err(),
+            "pack with non-reference ids + default should error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn column_pack_generated_count_mismatch_is_rejected() -> Result<(), String> {
+        // Pack has 2 columns but ring expects --columns 4.
+        let body = r#"
+[[columns]]
+id = "CC_A"
+sphere = "Physics"
+system_prompt = "a"
+[[columns]]
+id = "CC_B"
+sphere = "Coding"
+system_prompt = "b"
+"#;
+        let path = write_test_pack(body)?;
+        let mut cli = test_cli(TopologyKind::Ring, Some(4));
+        cli.column_pack = Some(path.clone());
+        let res = topology_plan(&cli);
+        std::fs::remove_file(&path).ok();
+        assert!(res.is_err(), "pack count != topology columns should error");
+        Ok(())
+    }
+
+    #[test]
+    fn column_pack_generated_matching_count_yields_plan() -> Result<(), String> {
+        // Pack has 3 columns matching --columns 3 for a ring.
+        let body = r#"
+[[columns]]
+id = "CC_A"
+sphere = "Physics"
+system_prompt = "a"
+level = 1
+[[columns]]
+id = "CC_B"
+sphere = "Coding"
+system_prompt = "b"
+level = 2
+[[columns]]
+id = "CC_C"
+sphere = "Mathematics"
+system_prompt = "c"
+level = 3
+"#;
+        let path = write_test_pack(body)?;
+        let mut cli = test_cli(TopologyKind::Ring, Some(3));
+        cli.column_pack = Some(path.clone());
+        let plan = topology_plan(&cli)?;
+        std::fs::remove_file(&path).ok();
+        let plan = match plan {
+            Some(p) => p,
+            None => return Err("expected a plan".to_string()),
+        };
+        assert_eq!(plan.columns.len(), 3, "pack columns should be used");
+        assert_eq!(plan.connections.len(), 3, "ring over 3 = 3 edges");
+        // Levels from the pack should be surfaced.
+        assert_eq!(plan.levels, vec![Some(1), Some(2), Some(3)]);
+        // The pack's OWN ids, not the replicated defaults.
+        assert_eq!(plan.columns[0].id, "CC_A");
         Ok(())
     }
 }
