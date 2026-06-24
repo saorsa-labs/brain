@@ -61,6 +61,14 @@ struct Cli {
     #[arg(long, default_value_t = 0.0)]
     temperature: f32,
 
+    /// Stop the consensus loop once mean token-Jaccard similarity of successive
+    /// per-column predictions reaches this value in `[0.0, 1.0]`. A cheap,
+    /// model-independent string proxy for semantic stabilization that does not
+    /// rely on the self-reported confidence a model can game. Omit to disable
+    /// (default), preserving confidence-only convergence.
+    #[arg(long, value_name = "0.0..1.0")]
+    min_prediction_similarity: Option<f32>,
+
     /// Input stimulus broadcast to all columns.
     #[arg(long, default_value = DEFAULT_INPUT)]
     input: String,
@@ -387,6 +395,13 @@ fn parse_detail(s: &str) -> Result<ImageDetail, String> {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(sim) = cli.min_prediction_similarity {
+        if !(0.0..=1.0).contains(&sim) {
+            return Err(
+                format!("--min-prediction-similarity must be in [0.0, 1.0], got {sim}").into(),
+            );
+        }
+    }
     println!("Initializing Project Thousand-Gemma Cortical Simulation Workstation...");
 
     if cli.dry_run {
@@ -504,6 +519,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
     };
     mesh.criteria.max_ticks = cli.ticks;
     mesh.criteria.min_ticks = cli.min_ticks;
+    mesh.criteria.min_prediction_similarity = cli.min_prediction_similarity;
 
     // 3. Broadcast stimulus and run the decentralized consensus epoch.
     println!("Broadcast Input Signal: '{}'", stimulus.text_str());
@@ -515,6 +531,9 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
         "\nEpoch complete: {} tick(s), stabilized={}, mean confidence={:.3}",
         result.ticks_run, result.stabilized, result.mean_confidence
     );
+    if let Some(reason) = result.convergence_reason {
+        println!("convergence: {reason}");
+    }
     let threshold = mesh.criteria.min_integration_confidence;
     println!(
         "integration: {} accepted, {} rejected (threshold={:.2})",
@@ -552,6 +571,7 @@ mod tests {
             min_ticks: 1,
             max_tokens: 1024,
             temperature: 0.0,
+            min_prediction_similarity: None,
             input: String::new(),
             image_urls: Vec::new(),
             image_detail: String::from("auto"),

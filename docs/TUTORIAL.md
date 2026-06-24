@@ -114,6 +114,20 @@ Key flags:
 - `--max-tokens 1024` — prevents JSON truncation when neighbor context
   lengthens the prompt.
 - `--temperature 0` — deterministic output for reproducible experiments.
+- `--min-prediction-similarity 0.85` — (optional) stop the loop once
+  predictions stop changing in *word overlap*, a model-independent signal that
+  doesn't rely on the self-reported confidence a model can game. The CLI prints
+  which criterion stopped the epoch, e.g. `convergence: prediction
+  token-similarity stabilized`.
+
+```bash
+cargo run -p ptg-cli --bin ptg -- \
+    --vllm-url http://127.0.0.1:18136 --model gemma-4-e2b-qat \
+    --topology ring --columns 4 \
+    --min-ticks 2 --ticks 4 --max-tokens 1024 --temperature 0 \
+    --min-prediction-similarity 0.85 \
+    --input "Describe the forces on a falling object."
+```
 
 ---
 
@@ -252,6 +266,7 @@ to 4096 or simplify the input.
 | `--topology ring-bi requires --columns >= 4` | Degeneracy guardrail: ring-bi with ≤3 columns == fully-connected | Use ≥4 columns or switch topology |
 | `--column-pack has N column(s) but topology expects M` | Pack count ≠ topology size | Match `--columns` to pack length, or adjust pack |
 | `duplicate column id` | Pack has two columns with the same id | Fix the pack |
+| `--min-prediction-similarity must be in [0.0, 1.0]` | Flag value outside the allowed range | Pass a value in `[0, 1]` (e.g. `0.85`), or omit to disable |
 | 501 on embeddings / semantic convergence | Server doesn't serve embeddings | Semantic convergence is deferred; use confidence-based convergence |
 
 ---

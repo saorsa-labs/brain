@@ -161,6 +161,13 @@ worth digging into:
 See the [roadmap](docs/ROADMAP.md) for the planned A3 scaled benchmark that
 would turn this pilot signal into evidence.
 
+> **First mitigation shipped (Phase 3A):** the convergence loop now also
+> supports a model-independent **prediction-stability** signal
+> (`--min-prediction-similarity`, token-Jaccard of successive predictions) that
+> does not rely on the self-reported confidence a model can game — the same
+> `tick_outputs` / `convergence_reason` plumbing gives us the within-run
+> measurement needed to study homogenization directly.
+
 ## Status
 
 Phases 0–2 are complete and panic-free. The workspace implements the domain

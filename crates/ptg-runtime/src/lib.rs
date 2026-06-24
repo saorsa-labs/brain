@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 use ndarray::Array1;
-use ptg_consensus::{confidence_vector, mean_confidence, quality_converged, ConvergenceCriteria};
+use ptg_consensus::{
+    confidence_converged, confidence_vector, mean_confidence, prediction_similarity_converged,
+    ConvergenceCriteria, ConvergenceReason,
+};
 use ptg_core::{
     ColumnOutputSchema, CorticalColumn, LateralConnection, Stimulus, TopologyError, TopologySpec,
 };
@@ -155,10 +158,12 @@ impl CorticalMesh {
         let max_ticks = self.criteria.max_ticks;
         let engine = Arc::clone(&self.engine);
         let mut previous_conf: Array1<f32> = Array1::zeros(0);
+        let mut previous_predictions: Vec<String> = Vec::new();
         let mut last_outputs: Vec<(String, ColumnOutputSchema)> = Vec::new();
         let mut tick_outputs: Vec<TickOutputs> = Vec::new();
         let mut ticks_run = 0u32;
         let mut stabilized = false;
+        let mut convergence_reason: Option<ConvergenceReason> = None;
 
         for tick in 1..=max_ticks {
             ticks_run = tick;
@@ -219,16 +224,30 @@ impl CorticalMesh {
 
             // Phase 3: convergence check. Only consider convergence once we've
             // run at least `min_ticks` ticks, so an overconfident model can't
-            // short-circuit the lateral-voting mechanism on tick 1.
+            // short-circuit the lateral-voting mechanism on tick 1. Confidence
+            // criteria are checked first, then the model-independent
+            // prediction-stability (token-Jaccard) criterion if enabled.
             let refs: Vec<&CorticalColumn> = self.column_ids_sorted_local_refs();
             let current = confidence_vector(&refs);
-            if tick >= self.criteria.min_ticks
-                && quality_converged(&refs, &previous_conf, &current, &self.criteria)
-            {
-                stabilized = true;
-                break;
+            let current_predictions: Vec<String> =
+                refs.iter().map(|c| c.last_prediction.clone()).collect();
+            if tick >= self.criteria.min_ticks {
+                let reason = confidence_converged(&refs, &previous_conf, &current, &self.criteria)
+                    .or_else(|| {
+                        prediction_similarity_converged(
+                            &previous_predictions,
+                            &current_predictions,
+                            &self.criteria,
+                        )
+                    });
+                if let Some(reason) = reason {
+                    stabilized = true;
+                    convergence_reason = Some(reason);
+                    break;
+                }
             }
             previous_conf = current;
+            previous_predictions = current_predictions;
         }
 
         let refs: Vec<&CorticalColumn> = self.column_ids_sorted_local_refs();
@@ -246,6 +265,7 @@ impl CorticalMesh {
             rejected_outputs,
             mean_confidence: mean,
             stabilized,
+            convergence_reason,
         })
     }
 
@@ -294,6 +314,9 @@ pub struct MeshResult {
     pub mean_confidence: f32,
     /// Whether a quality convergence criterion was met (vs. running out of ticks).
     pub stabilized: bool,
+    /// Which quality criterion terminated the epoch, if any. `None` when the
+    /// epoch ran to `max_ticks` without stabilizing.
+    pub convergence_reason: Option<ConvergenceReason>,
 }
 
 /// Build the default reference mesh (§8.4) from the shared engine.
@@ -437,6 +460,10 @@ mod tests {
         assert!(result.mean_confidence >= 0.8);
         assert_eq!(result.accepted_outputs.len(), 4, "all high-conf accepted");
         assert!(result.rejected_outputs.is_empty());
+        assert_eq!(
+            result.convergence_reason,
+            Some(ConvergenceReason::MeanConfidence)
+        );
         Ok(())
     }
 
@@ -481,6 +508,80 @@ mod tests {
             assert!(out.prediction.ends_with("-pred"));
             assert!((0.0..=1.0).contains(&out.confidence));
         }
+        assert_eq!(
+            result.convergence_reason,
+            Some(ConvergenceReason::ConfidenceDelta)
+        );
+        Ok(())
+    }
+
+    /// Constant-prediction, phase-shifted-confidence engine: each column's
+    /// confidence rotates through a distinct phase per tick, so the confidence
+    /// vector's *direction* keeps changing (no mean/delta/cosine criterion can
+    /// fire) while predictions are identical every tick — leaving the
+    /// token-Jaccard criterion as the only thing that can converge.
+    struct PredictionStableEngine;
+
+    #[async_trait]
+    impl ColumnEngine for PredictionStableEngine {
+        async fn execute_column_tick(
+            &self,
+            column: &CorticalColumn,
+            _stimulus: &ptg_core::Stimulus,
+            _lateral: &str,
+        ) -> Result<ColumnOutputSchema, VllmEngineError> {
+            // Per-sphere phase so the confidence vector genuinely rotates
+            // direction tick to tick (a uniform vector would trivially hit
+            // cosine similarity 1.0). Predictions stay constant so the
+            // token-Jaccard of successive ticks is 1.0.
+            let phase: u32 = match column.sphere.as_str() {
+                "Physics" => 0,
+                "Mathematics" => 1,
+                "Coding" => 2,
+                _ => 3,
+            };
+            let confidence = 0.2 + 0.15 * ((column.history_buffer.len() as u32 + phase) % 4) as f32;
+            Ok(ColumnOutputSchema {
+                reference_frame_coordinates: format!("coord-{}", column.id),
+                prediction: format!("{}-stable-prediction-text", column.sphere.as_str()),
+                confidence,
+                domain_fields: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_epoch_converges_via_prediction_similarity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut mesh = default_mesh(Arc::new(PredictionStableEngine))?;
+        // Default confidence thresholds never fire: mean stays ~0.43 < 0.8 and
+        // the confidence vector keeps rotating direction.
+        mesh.criteria.max_ticks = 5;
+        // Prediction-stability criterion enabled.
+        mesh.criteria.min_prediction_similarity = Some(0.5);
+        let result = mesh.run_text_epoch("stimulus").await?;
+        assert_eq!(
+            result.ticks_run, 2,
+            "tick 2 is the first with a previous prediction"
+        );
+        assert!(result.stabilized);
+        assert_eq!(
+            result.convergence_reason,
+            Some(ConvergenceReason::PredictionSimilarity)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prediction_similarity_disabled_by_default_is_inert(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Same engine, but min_prediction_similarity stays None (default):
+        // nothing converges, the epoch runs to max_ticks without stabilizing.
+        let mut mesh = default_mesh(Arc::new(PredictionStableEngine))?;
+        mesh.criteria.max_ticks = 2;
+        let result = mesh.run_text_epoch("stimulus").await?;
+        assert!(!result.stabilized);
+        assert_eq!(result.convergence_reason, None);
         Ok(())
     }
 

@@ -65,13 +65,20 @@ compute-matched controls pass review. No headline quality claim until then.
 
 - [~] Pluggable topologies: ring, torus, small-world (§3.1.3). **Library +
       runtime + CLI `--topology` flag landed.** `TopologySpec` in `ptg-core`, `mesh_with_topology` in `ptg-runtime`, `--topology/--columns` in `ptg`. Bench `--topology` flag deferred until a topology-aware benchmark is wired.
+- [x] Early-stop **prediction-stability** convergence (cheap string proxy,
+      §9.3-adjacent, unblocked): `min_prediction_similarity` (`ConvergenceCriteria`
+      field, `Option<f32>`), token-Jaccard similarity of successive per-column
+      predictions. A model-independent signal that does not rely on the
+      self-reported confidence a model can game. Surfaced via
+      `--min-prediction-similarity 0.0..1.0` and reported as
+      `MeshResult.convergence_reason`.
 - [ ] Weighted / attention-routed lateral connections (§9.1 "Dynamic Topology
-      Scaling") — columns choose which neighbors to listen to.
-- [ ] Full **semantic** cosine convergence over prediction embeddings (§9.3),
-      requiring an embedding backend (blocked: live server returns HTTP 501 on
-      `/v1/embeddings`).
-- [ ] Early-stop similarity checks between iterations (cheap string proxy as a
-      `ConvergenceCriteria` field — unblocked, not yet built).
+      Scaling") — columns choose which neighbors to listen to. The hypothesized
+      mitigation for the homogenization signal (see README *Early research
+      signal*); lead with diversity-preserving routing, not pure confidence-top-k.
+- [ ] Full **semantic** cosine convergence over prediction embeddings (§9.3) —
+      blocked: the live server returns HTTP 501 on `/v1/embeddings`. The cheap
+      token-Jaccard proxy above is the unblocked approximation.
 
 ## Phase 4 — Scale & observability
 
