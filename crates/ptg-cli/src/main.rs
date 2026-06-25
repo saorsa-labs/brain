@@ -120,7 +120,7 @@ struct Cli {
     #[arg(long, default_value_t = 4)]
     small_world_degree: usize,
 
-    /// Small-world edge rewire probability in [0,1] (default 0.10).
+    /// Small-world edge rewire probability in `[0,1]` (default 0.10).
     #[arg(long, default_value_t = 0.10)]
     small_world_rewire: f64,
 
@@ -357,7 +357,14 @@ fn topology_plan(cli: &Cli) -> Result<Option<MeshPlan>, String> {
     };
     let ids: Vec<String> = columns.iter().map(|c| c.id.clone()).collect();
     let (spec, label) = match cli.topology {
-        TopologyKind::Default => unreachable!("handled above"),
+        TopologyKind::Default => {
+            // `Default` is dispatched and returned earlier in `topology_plan`
+            // (it never reaches this second match). Surface as an error rather
+            // than panic, per the panic-free policy.
+            return Err(
+                "internal: Default topology should be handled before topology dispatch".to_string(),
+            );
+        }
         TopologyKind::Ring => (
             TopologySpec::Ring {
                 bidirectional: false,
@@ -761,7 +768,9 @@ mod tests {
         static MAIN_PACK_COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
         let id = MAIN_PACK_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = dir.join(format!("ptg-main-pack-{id}.toml"));
+        // PID + counter: nextest runs each test in its own process, so a
+        // per-process counter alone collides on a shared temp path.
+        let path = dir.join(format!("ptg-main-pack-{}-{id}.toml", std::process::id()));
         std::fs::write(&path, body).map_err(|e| format!("write: {e}"))?;
         Ok(path)
     }

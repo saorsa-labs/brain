@@ -260,6 +260,12 @@ impl CorticalMesh {
 
     /// Run one full epoch (the three-phase loop) over the given stimulus.
     ///
+    /// **Single-use contract.** This mutates per-column state (`last_prediction`,
+    /// `last_confidence`, `history_buffer`) and does NOT reset it on entry, so a
+    /// fresh mesh is required per epoch. Reusing a mesh would leak the prior
+    /// epoch's predictions into tick 1, breaking the "tick 1 = no lateral context"
+    /// invariant the benchmark relies on. (`ptg-bench` rebuilds the mesh per epoch.)
+    ///
     /// # Errors
     /// [`MeshError::Engine`] if any column's tick fails (fail-fast).
     pub async fn run_epoch(&mut self, stimulus: &Stimulus) -> Result<MeshResult, MeshError> {

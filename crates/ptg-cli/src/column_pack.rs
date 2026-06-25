@@ -122,7 +122,10 @@ mod tests {
     fn write_pack(toml_body: &str) -> Result<std::path::PathBuf, String> {
         let dir = std::env::temp_dir();
         let id = PACK_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = dir.join(format!("ptg-pack-test-{id}.toml"));
+        // Include the PID: nextest runs each test in its own process, so a
+        // per-process counter alone collides on a shared temp path. PID + counter
+        // is unique across the whole run.
+        let path = dir.join(format!("ptg-pack-test-{}-{id}.toml", std::process::id()));
         let mut f = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
         f.write_all(toml_body.as_bytes())
             .map_err(|e| format!("write: {e}"))?;

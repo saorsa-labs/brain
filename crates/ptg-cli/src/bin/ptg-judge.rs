@@ -494,12 +494,16 @@ fn echo_screen_against_sources(c2: &CanonicalColumn, source_tick1_predictions: &
         return false;
     };
     for src in source_tick1_predictions {
-        if src.chars().count() < 40 {
+        // Slide a 40-CHAR (not byte) window: model predictions routinely contain
+        // multibyte UTF-8 (em dashes, smart quotes, °, µ, CJK), and byte slicing
+        // `src[i..i+40]` would panic on a non-char-boundary.
+        let chars: Vec<char> = src.chars().collect();
+        if chars.len() < 40 {
             continue;
         }
-        for i in 0..src.len().saturating_sub(40) {
-            let window = &src[i..i + 40];
-            if p2.contains(window) {
+        for window in chars.windows(40) {
+            let needle: String = window.iter().collect();
+            if p2.contains(&needle) {
                 return true;
             }
         }

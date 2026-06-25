@@ -520,7 +520,7 @@ impl EngineBuilder {
         self
     }
 
-    /// Set the max output tokens (default `400`).
+    /// Set the max output tokens (default `512`).
     #[must_use]
     pub const fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
