@@ -15,7 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ptg_core::{ColumnOutputSchema, CorticalColumn, SchemaError, Stimulus, StimulusPart};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+
+const CHAT_COMPLETION_MAX_ATTEMPTS: u32 = 3;
 
 /// Errors surfaced by the inference engine layer.
 #[derive(Debug, thiserror::Error)]
@@ -340,6 +343,26 @@ pub struct InferenceEngine {
     metrics_sink: Option<Arc<dyn MetricsSink>>,
 }
 
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn chat_retry_backoff(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(500),
+        1 => Duration::from_secs(1),
+        _ => Duration::from_secs(2),
+    }
+}
+
 impl InferenceEngine {
     /// Create a new engine client targeting the given vLLM base URL and model.
     ///
@@ -417,12 +440,8 @@ impl InferenceEngine {
         let endpoint = format!("{}/v1/chat/completions", self.vllm_url);
         let start = Instant::now();
         let response = self
-            .client
-            .post(endpoint)
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?;
+            .send_chat_completion_with_retries(&endpoint, &request)
+            .await?;
         let parsed: ChatCompletionResponse = response.json().await?;
         let latency = start.elapsed();
 
@@ -454,6 +473,35 @@ impl InferenceEngine {
             .and_then(|c| c.message.content)
             .ok_or(EngineError::MissingContent)?;
         Ok((raw, metrics))
+    }
+
+    async fn send_chat_completion_with_retries(
+        &self,
+        endpoint: &str,
+        request: &ChatRequest<'_>,
+    ) -> Result<reqwest::Response, EngineError> {
+        let mut attempt = 0u32;
+        while attempt < CHAT_COMPLETION_MAX_ATTEMPTS {
+            let final_attempt = attempt + 1 == CHAT_COMPLETION_MAX_ATTEMPTS;
+            match self.client.post(endpoint).json(request).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if is_retryable_status(status) && !final_attempt {
+                        tokio::time::sleep(chat_retry_backoff(attempt)).await;
+                    } else {
+                        return response.error_for_status().map_err(EngineError::Http);
+                    }
+                }
+                Err(err) => {
+                    if final_attempt {
+                        return Err(EngineError::Http(err));
+                    }
+                    tokio::time::sleep(chat_retry_backoff(attempt)).await;
+                }
+            }
+            attempt += 1;
+        }
+        Err(EngineError::MissingContent)
     }
 
     /// Build the composite prompt exactly as specified in §8.3.
@@ -626,6 +674,26 @@ mod tests {
         assert_eq!(engine.model, "test/model");
         assert_eq!(engine.vllm_url, "http://localhost:8000");
         Ok(())
+    }
+
+    #[test]
+    fn retryable_statuses_are_bounded_to_transient_failures() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNPROCESSABLE_ENTITY));
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded() {
+        assert_eq!(chat_retry_backoff(0), Duration::from_millis(500));
+        assert_eq!(chat_retry_backoff(1), Duration::from_secs(1));
+        assert_eq!(chat_retry_backoff(2), Duration::from_secs(2));
+        assert_eq!(chat_retry_backoff(99), Duration::from_secs(2));
     }
 
     #[test]
