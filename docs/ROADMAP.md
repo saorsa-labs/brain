@@ -56,20 +56,28 @@ compute-matched controls pass review. No headline quality claim until then.
 - [x] Committed methodology doc + fair-baseline design (C1–C4 confounds neutralized).
 - [x] Instrument the engine for per-call `usage` (incl. `cached_tokens`) +
       `finish_reason`, without changing the `ColumnEngine` trait.
-- [x] `ptg-bench` harness: `mesh_adaptive` / `sphere_x4_no_lateral` / `mono_all_prompts` /
-      `mono_x4`; JSONL raw records + Markdown summary. `--routing-policy` + per-tick
-      route observability wired.
+- [x] `ptg-bench` harness: `mesh_adaptive` / `sphere_x4_second_look_no_lateral` /
+      `sphere_x4_no_lateral` / `mono_all_prompts` / `mono_x4`; JSONL raw records +
+      Markdown summary. `--routing-policy` + per-tick route observability wired.
 - [x] Pilot run against `gemma-4-e2b-qat` (5 prompts × 3 repeats × 4 conditions).
       Results recorded in [`PILOT_FINDINGS.md`](./PILOT_FINDINGS.md) (pilot-only,
-      no headline). Key signals: mesh costs 3–4.5× compute with quality *unmeasured*;
-      cache-hit collapses under lateral exchange (43.5% vs 98%+); homogenization
-      lead from v0.2.0 does not replicate strongly at pilot scale.
-- [ ] **Quality pass: run `ptg-judge` on the pilot outputs.** The missing half —
-      latency/token numbers are meaningless without knowing if the mesh produces
-      *better* answers. This is the highest-information unblocked move.
-- [ ] Scale to ~50+ prompts + paired statistics (median/CI/σ) if the quality pass
-      is sound. The homogenization comparison needs statistical power to become
-      evidence rather than a lead.
+      no headline). Key signals: mesh costs 3–4.5× compute; cache-hit collapses
+      under lateral exchange (43.5% vs 98%+); homogenization lead from v0.2.0
+      does not replicate strongly at pilot scale.
+- [x] A2 quality pass: ran `ptg-judge` on the pilot outputs. Results recorded in
+      [`JUDGE_FINDINGS.md`](./JUDGE_FINDINGS.md): lateral context **activates**
+      strongly (0.61–0.74 edit distance) but does **not** improve perceived
+      quality vs tick 1 (14 vs 13, coin flip), with 25% echo-exclusion leakage.
+- [x] A3 equal-call second-look control added to `ptg-bench`:
+      `sphere_x4_second_look_no_lateral` (same 2-tick / 8-call budget as
+      `mesh_adaptive`, but no neighbor text on tick 2). This isolates lateral
+      context from "the model got a second pass."
+- [ ] Extend `ptg-judge` for A3: compare `mesh_adaptive` final tick vs
+      `sphere_x4_second_look_no_lateral` final tick, matched by prompt/repeat/nonce.
+- [ ] Run the A3 experiment and decide: if lateral tick 2 does not beat no-lateral
+      second-look tick 2, scaling current lateral-text exchange is premature.
+- [ ] Scale to ~50+ prompts + paired statistics (median/CI/σ) only if the A3
+      quality attribution is sound.
 
 ## Phase 3 — Topologies & convergence depth ✅ (unblocked items done)
 

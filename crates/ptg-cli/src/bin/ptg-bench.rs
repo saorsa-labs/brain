@@ -8,6 +8,9 @@
 //! # Generators (conditions)
 //! - `mesh_adaptive` — the PTG mesh (4 columns + lateral voting + convergence).
 //!   Primary artifact = ALL columns (unfiltered); accepted/rejected recorded.
+//! - `sphere_x4_second_look_no_lateral` — A3 control: 2-tick / 8-call sphere
+//!   mesh with lateral disabled (same budget as `mesh_adaptive`, no neighbor text).
+//! - `sphere_x4_no_lateral` — 1-tick / 4-call sphere mesh (prompt diversity without voting).
 //! - `mono_all_prompts` — 1 call with all 4 sphere prompts + the task.
 //! - `mono_x4` — 4 independent monolithic calls (compute-matched to a 1-tick mesh).
 //!
@@ -52,11 +55,14 @@ enum Condition {
     /// control by the methodology.
     MonoX4,
     /// 4 sphere-specialized calls with NO lateral context and NO voting
-    /// (implemented as a 1-tick mesh). This is the PRIMARY mechanism control:
-    /// `mesh_adaptive` = diverse columns + voting; `sphere_x4_no_lateral` =
-    /// diverse columns − voting. The difference isolates the cortical
-    /// mechanism from prompt diversity.
+    /// (implemented as a 1-tick mesh). This is the prompt-diversity / no-voting
+    /// control: diverse columns − lateral exchange.
     SphereX4NoLateral,
+    /// Same 4 sphere-specialized columns and same 2-tick / 8-call budget as
+    /// `mesh_adaptive`, but tick 2 receives **no lateral context**. This is the
+    /// A3 second-look control: it separates "lateral context helped" from "the
+    /// model got a second pass / extra calls."
+    SphereX4SecondLookNoLateral,
 }
 
 impl Condition {
@@ -66,6 +72,7 @@ impl Condition {
             Self::MonoAllPrompts => "mono_all_prompts",
             Self::MonoX4 => "mono_x4",
             Self::SphereX4NoLateral => "sphere_x4_no_lateral",
+            Self::SphereX4SecondLookNoLateral => "sphere_x4_second_look_no_lateral",
         }
     }
 }
@@ -234,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(c) => vec![c],
         None => vec![
             Condition::MeshAdaptive,
+            Condition::SphereX4SecondLookNoLateral,
             Condition::SphereX4NoLateral,
             Condition::MonoAllPrompts,
             Condition::MonoX4,
@@ -467,6 +475,9 @@ async fn run_one(
     ));
     let outcome: Result<(serde_json::Value, MeshExtras), String> = match cond {
         Condition::MeshAdaptive => run_mesh(mesh_engine, &stimulus, args).await,
+        Condition::SphereX4SecondLookNoLateral => {
+            run_mesh_second_look_no_lateral(mesh_engine, &stimulus, args).await
+        }
         Condition::SphereX4NoLateral => run_mesh_one_tick(mesh_engine, &stimulus).await,
         Condition::MonoAllPrompts => run_mono_once(mono_engine, &stimulus).await,
         Condition::MonoX4 => run_mono_x4(mono_engine, &stimulus).await,
@@ -520,26 +531,14 @@ async fn run_mesh(
     mesh.criteria.min_ticks = args.min_ticks;
     mesh.routing_policy = args.routing_policy.to_policy(args.routing_k);
     let threshold = mesh.criteria.min_integration_confidence;
-    // Columns that RECEIVE lateral context (have at least one neighbor).
-    // In the default topology this is {PHYSICS, MATH, CODE}; PSYCH listens to
-    // nobody, so its tick-1 and tick-2 outputs are byte-identical at temp 0 —
-    // making PSYCH a free determinism-validity gate (see BENCHMARKING.md).
-    let receivers = lateral_receivers(&mesh);
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
-    let last_tick = result.ticks_run;
+    let final_active = active_listeners_for_tick(result.tick_outputs.last());
     let outputs: Vec<serde_json::Value> = result
         .outputs
         .iter()
-        .map(|(id, schema)| {
-            canonical_column(
-                id,
-                schema,
-                threshold,
-                lateral_active(last_tick, id, &receivers),
-            )
-        })
+        .map(|(id, schema)| canonical_column(id, schema, threshold, final_active.contains(id)))
         .collect();
-    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold, &receivers));
+    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold));
     let extras = MeshExtras {
         ticks_run: Some(result.ticks_run),
         stabilized: Some(result.stabilized),
@@ -552,11 +551,49 @@ async fn run_mesh(
     Ok((serde_json::Value::Array(outputs), extras))
 }
 
-/// `sphere_x4_no_lateral` — the PRIMARY mechanism control. Runs the default mesh
+/// A3 second-look control: same columns, same 2-tick / 8-call budget as
+/// `mesh_adaptive`, but no lateral sources are selected on tick 2. At temp 0,
+/// because the engine prompt does not include column history, this isolates
+/// lateral text from the mere fact of getting a second pass.
+async fn run_mesh_second_look_no_lateral(
+    engine: &Arc<dyn ptg_vllm::ColumnEngine>,
+    stimulus: &Stimulus,
+    args: &Args,
+) -> Result<(serde_json::Value, MeshExtras), String> {
+    let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
+    mesh.criteria.max_ticks = args.max_ticks;
+    mesh.criteria.min_ticks = args.min_ticks;
+    disable_lateral_context(&mut mesh);
+    let threshold = mesh.criteria.min_integration_confidence;
+    let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
+    let final_active = active_listeners_for_tick(result.tick_outputs.last());
+    let outputs: Vec<serde_json::Value> = result
+        .outputs
+        .iter()
+        .map(|(id, schema)| canonical_column(id, schema, threshold, final_active.contains(id)))
+        .collect();
+    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold));
+    let extras = MeshExtras {
+        ticks_run: Some(result.ticks_run),
+        stabilized: Some(result.stabilized),
+        mean_confidence: Some(result.mean_confidence),
+        accepted_count: Some(result.accepted_outputs.len() as u32),
+        rejected_count: Some(result.rejected_outputs.len() as u32),
+        integration_threshold: Some(threshold),
+        tick_outputs,
+    };
+    Ok((serde_json::Value::Array(outputs), extras))
+}
+
+fn disable_lateral_context(mesh: &mut ptg_runtime::CorticalMesh) {
+    // k=0 is the runtime-supported "select no sources" policy. We keep the
+    // topology intact but force every listener to receive empty lateral context.
+    mesh.routing_policy = RoutingPolicy::ConfidenceTopK { k: 0 };
+}
+
+/// `sphere_x4_no_lateral` — the 1-tick no-voting control. Runs the default mesh
 /// with `max_ticks = 1`: 4 sphere-specialized column calls, empty lateral
-/// context (no prior ticks), no voting/convergence. Reuses the same engine/path
-/// and per-sphere validation as `mesh_adaptive`, so the ONLY difference vs a
-/// 2-tick `mesh_adaptive` is the absence of lateral exchange + integration.
+/// context (no prior ticks), no voting/convergence.
 async fn run_mesh_one_tick(
     engine: &Arc<dyn ptg_vllm::ColumnEngine>,
     stimulus: &Stimulus,
@@ -564,22 +601,14 @@ async fn run_mesh_one_tick(
     let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
     mesh.criteria.max_ticks = 1;
     let threshold = mesh.criteria.min_integration_confidence;
-    let receivers = lateral_receivers(&mesh);
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
-    let last_tick = result.ticks_run;
+    let final_active = active_listeners_for_tick(result.tick_outputs.last());
     let outputs: Vec<serde_json::Value> = result
         .outputs
         .iter()
-        .map(|(id, schema)| {
-            canonical_column(
-                id,
-                schema,
-                threshold,
-                lateral_active(last_tick, id, &receivers),
-            )
-        })
+        .map(|(id, schema)| canonical_column(id, schema, threshold, final_active.contains(id)))
         .collect();
-    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold, &receivers));
+    let tick_outputs = Some(canonical_ticks(&result.tick_outputs, threshold));
     let extras = MeshExtras {
         ticks_run: Some(result.ticks_run),
         stabilized: Some(result.stabilized),
@@ -644,13 +673,13 @@ fn canonical_column(
     })
 }
 
-/// Routing-policy label for a condition's record. Monolithic and 1-tick
-/// controls never exercise lateral exchange, so they are labelled `"all"`
-/// (the V1 default) for reproducibility regardless of `--routing-policy`.
+/// Routing-policy label for a condition's record. Monolithic and no-lateral
+/// controls never exercise lateral exchange, so they are labelled `"none"`
+/// for reproducibility regardless of `--routing-policy`.
 fn cond_routing_label(cond: Condition, args: &Args) -> String {
     match cond {
         Condition::MeshAdaptive => args.routing_policy.label().to_string(),
-        _ => "all".to_string(),
+        _ => "none".to_string(),
     }
 }
 
@@ -661,20 +690,15 @@ fn cond_routing_label(cond: Condition, args: &Args) -> String {
 /// downstream analysis the within-run mechanism signal: tick 1 (no lateral
 /// context) vs tick 2 (lateral context injected), plus which neighbors each
 /// column actually heard from and at what weight.
-fn canonical_ticks(
-    ticks: &[TickOutputs],
-    threshold: f32,
-    receivers: &std::collections::BTreeSet<String>,
-) -> Vec<serde_json::Value> {
+fn canonical_ticks(ticks: &[TickOutputs], threshold: f32) -> Vec<serde_json::Value> {
     ticks
         .iter()
         .map(|t| {
+            let active = active_listeners_for_tick(Some(t));
             let cols: Vec<serde_json::Value> = t
                 .outputs
                 .iter()
-                .map(|(id, schema)| {
-                    canonical_column(id, schema, threshold, lateral_active(t.tick, id, receivers))
-                })
+                .map(|(id, schema)| canonical_column(id, schema, threshold, active.contains(id)))
                 .collect();
             let routes: Vec<serde_json::Value> = t
                 .routes
@@ -702,26 +726,19 @@ fn canonical_ticks(
         .collect()
 }
 
-/// The set of column ids that RECEIVE lateral context (have at least one
-/// neighbor in the mesh's directed adjacency). In the default topology this is
-/// {CC_PHYSICS_01, CC_MATH_01, CC_CODE_01}; CC_PSYCH_01 listens to nobody.
-fn lateral_receivers(mesh: &ptg_runtime::CorticalMesh) -> std::collections::BTreeSet<String> {
-    mesh.adjacency_list
-        .iter()
-        .filter(|(_, nbrs)| !nbrs.is_empty())
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
-/// Whether `column_id` actually received non-empty lateral context on `tick`.
-/// Lateral context is empty on tick 1 (no prior ticks recorded) and non-empty
-/// on tick >= 2 only for columns that have neighbors (the receivers).
-fn lateral_active(
-    tick: u32,
-    column_id: &str,
-    receivers: &std::collections::BTreeSet<String>,
-) -> bool {
-    tick >= 2 && receivers.contains(column_id)
+/// The set of listener ids that actually received non-empty lateral context on
+/// a tick. This is route-based, not adjacency-based: with dynamic routing, a
+/// listener can have neighbors but select none (`k=0` in the A3 no-lateral
+/// control) or only a sparse subset.
+fn active_listeners_for_tick(tick: Option<&TickOutputs>) -> std::collections::BTreeSet<String> {
+    tick.map(|t| {
+        t.routes
+            .iter()
+            .filter(|r| !r.sources.is_empty())
+            .map(|r| r.listener_id.clone())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Map a column's output to its perspective label, derived from which sphere-

@@ -35,34 +35,39 @@ a naive comparison toward the mesh and must be neutralized.
 
 | ID | Confound | Mitigation in this design |
 |----|----------|---------------------------|
-| **C1** | "More compute = better": the mesh spends `4 × ticks` calls vs the baseline's 1, so any quality win is confounded with compute. | The **PRIMARY mechanism control is `sphere_x4_no_lateral`** (4 diverse sphere calls, no voting). `mono_x4` (4 identical calls) is a secondary compute-only control that is **degenerate at `temperature: 0`** (4 identical outputs) and does not separate prompt-diversity from the mechanism. Report quality normalized by total inference tokens AND by call count; only compare at **equal call count** (stratify `mesh_adaptive` by `ticks_run`). Never select "best-of-4 by judge" as primary (oracle selection). |
+| **C1** | "More compute = better": the mesh spends `4 × ticks` calls vs the baseline's 1, so any quality win is confounded with compute. | Use two mechanism controls: (1) `sphere_x4_no_lateral` (4 diverse sphere calls, no voting) for prompt-diversity vs monolithic comparisons; (2) **A3 `sphere_x4_second_look_no_lateral`** (same 2-tick / 8-call budget as `mesh_adaptive`, but tick 2 has empty lateral context) for lateral-vs-second-look attribution. `mono_x4` (4 identical calls) is a secondary compute-only control that is **degenerate at `temperature: 0`** (4 identical outputs) and does not separate prompt-diversity from the mechanism. Never select "best-of-4 by judge" as primary (oracle selection). |
 | **C2** | Prompt-verbosity: the mesh carries ~4 specialized system prompts; a short generic baseline rewards verbosity, not mechanism. | The monolithic baseline receives **the union of the four PTG sphere prompts plus a minimal combining instruction** (so it produces a parseable multi-perspective object). This is **not token-equal** to the mesh (the monolith also gets the combining instruction); the delta is small, acknowledged, and the actual `prompt_tokens` of both are recorded. |
 | **C3** | Prefix-cache asymmetry + token double-counting: the mesh reuses 4 stable prefixes across ticks; naive summing double-counts cached tokens; naive subtraction makes the mesh look artificially cheap. | **Report gross `prompt_tokens`, `cached_tokens`, and `completion_tokens` separately per condition.** Two cache-adjusted views are emitted, both named explicitly: **`prompt_tokens_cache_adjusted = prompt − cached`** (counts each cached prefix once; completion excluded) and **`total_tokens_cache_adjusted = total − cached = (prompt−cached)+completion`** (true compute-equivalent cost, since completion is never cached). Also report the **cache-hit rate**. **v0 measures WARM only** (cold is not implemented); the first run per side is discarded as warmup. |
 | **C4** | Self-selection / survivorship: the mesh rejects sub-threshold columns; confidence is self-reported; comparing mesh-accepted vs baseline-raw is best-of-filtered vs raw. | (1) **Primary mesh artifact = ALL columns (unfiltered)**; accepted-only is a **secondary ablation** that quantifies the filter's contribution, never the headline. (2) Because confidence is self-reported, **all mesh internal metrics (`mean_confidence`, `stabilized`, accept-rate) are treated as non-evidence for quality**; quality is scored externally only. |
 
 ## Conditions (generators)
 
-All three generators run on the same model/server with identical generation
-settings (see "Fixed settings").
+All generators run on the same model/server with identical generation settings
+(see "Fixed settings").
 
 1. **`mesh_adaptive`** — the current PTG mesh: 4 columns (Physics/Math/Coding/
    Psychology), 3-phase epoch, lateral-context injection, confidence-vector
    convergence (adaptive ticks), accepted/rejected split. Evaluated on **all
    columns** (primary) and accepted-only (ablation).
 
-2. **`sphere_x4_no_lateral`** — **the PRIMARY mechanism control.** The default
-   mesh run with `max_ticks = 1`: 4 sphere-specialized column calls with empty
-   lateral context (no prior ticks) and no voting/convergence, reusing the same
-   engine path and per-sphere validation as the mesh. This isolates the cortical
-   mechanism: `mesh_adaptive` = diverse columns **+** voting; this condition =
-   diverse columns **−** voting. The difference is the mechanism's contribution.
+2. **`sphere_x4_second_look_no_lateral`** — **A3 equal-call control.** The
+   default mesh run with the same `min_ticks/max_ticks` as `mesh_adaptive`, but
+   lateral routing disabled (`k=0` source selection). This spends the same
+   2-tick / 8-call budget as `mesh_adaptive` while keeping tick-2 prompts free of
+   neighbor text. It isolates lateral context from "the model got a second pass."
 
-3. **`mono_all_prompts`** — a single chat-completion call whose prompt is **all
+3. **`sphere_x4_no_lateral`** — 1-tick / 4-call prompt-diversity control. The
+   default mesh run with `max_ticks = 1`: 4 sphere-specialized column calls with
+   empty lateral context (no prior ticks) and no voting/convergence, reusing the
+   same engine path and per-sphere validation as the mesh. This separates prompt
+   diversity from monolithic baselines, but it is not equal-call to 2-tick mesh.
+
+4. **`mono_all_prompts`** — a single chat-completion call whose prompt is **all
    four PTG sphere prompts concatenated** plus the task and a minimal combining
    instruction. Tests the mechanism at equal instruction *union* but 1 call.
    Completion cap = `4 × per-column cap`.
 
-4. **`mono_x4`** — **4 identical** `mono_all_prompts` calls (same prompt, same
+5. **`mono_x4`** — **4 identical** `mono_all_prompts` calls (same prompt, same
    task). At `temperature: 0` these produce 4 identical outputs, so this is a
    **degenerate compute-only control** (C1) that does NOT separate
    prompt-diversity from the mechanism. It is relegated to a secondary control.
@@ -99,7 +104,8 @@ Identical across all conditions:
   overconfident model can self-report `mean_confidence ≥ min_mean_confidence` on
   tick 1 — converging before any lateral exchange — the benchmark forces
   `min_ticks ≥ 2` for `mesh_adaptive` so the lateral-voting mechanism is actually
-  exercised. `sphere_x4_no_lateral` stays forced at `max_ticks = 1`.
+  exercised. The A3 `sphere_x4_second_look_no_lateral` uses the same tick budget
+  with lateral disabled; `sphere_x4_no_lateral` stays forced at `max_ticks = 1`.
 
 ## Pilot findings (mechanism)
 
@@ -116,9 +122,11 @@ provenance:
 - **Output truncation dominates early failures.** The math column is verbose and
   overflows a 512-token cap → malformed JSON. Raising the per-column cap (and the
   monolithic cap to match, within `-c 4096`) eliminates this.
-- A **true equal-call mechanism ablation** (`sphere_x8_no_lateral` / forced-2-tick
-  no-lateral) is deferred to the quality/scaled phase (A3): a naive 8-call
-  control at `temperature: 0` would just repeat identical calls.
+- A **true equal-call mechanism ablation** is now implemented as
+  `sphere_x4_second_look_no_lateral` (A3): same 2-tick / 8-call budget as
+  `mesh_adaptive`, but no neighbor text on tick 2. At `temperature: 0` it should
+  be near-identical across ticks; that is the point — it controls for the second
+  pass itself.
 
 ## Metrics
 
@@ -181,12 +189,14 @@ deltas from that run are suspect → the run is flagged `determinism_failed` and
 excluded from mechanism comparisons.
 
 **Secondary comparisons** (directional only, caveated): mesh-final vs
-`sphere_x4_no_lateral` (cross-run determinism risk + 8-vs-4 call asymmetry); and
-mesh-final vs `mono_all_prompts`. Neither can stand alone as a mechanism claim.
+`sphere_x4_no_lateral` (8-vs-4 call asymmetry); and mesh-final vs
+`mono_all_prompts`. Neither can stand alone as a mechanism claim.
 
-**Thesis-level consensus verdict** requires either a future explicit
-consensus/integration artifact or the A3 equal-call no-lateral ablation
-(`sphere_x8_no_lateral`).
+**A3 quality attribution** uses the equal-call no-lateral second-look control
+`sphere_x4_second_look_no_lateral`: mesh-final tick 2 with lateral context vs
+second-look tick 2 without lateral context. This answers "did lateral context
+help more than just paying for a second pass?" It is still not a thesis-level
+consensus verdict because v0 has no explicit integrated consensus artifact.
 
 Comparisons are deliberately separated into three questions:
 
@@ -194,27 +204,16 @@ Comparisons are deliberately separated into three questions:
    beat a single prompt? `sphere_x4_no_lateral` (4 diverse calls, no voting) vs
    `mono_x4` (4 identical calls) vs `mono_all_prompts` (1 call). These ARE
    equal-call-count or single-call and fair as stated.
-2. **Mechanism:** does lateral voting on top of diversity help? The ONLY honest
-   comparison is `mesh_adaptive` at `ticks_run ≥ 2` (lateral context is non-empty)
-   vs `sphere_x4_no_lateral`. Note: a `mesh_adaptive` run that stops at tick 1 is
-   **identical** to `sphere_x4_no_lateral` (same calls, no lateral context) and
-   carries NO mechanism signal. **Separate two distinct attributions:**
-   - **Quality attribution is CLEAN at `temperature: 0`.** The run nonce is
-     condition-independent, so a mesh column's tick-1 call is byte-identical to
-     that column's `sphere_x4_no_lateral` call; tick 2 differs *only* by the
-     injected lateral string. A judge-quality delta between mesh-final and
-     sphere is therefore strongly attributable to the lateral context. The even
-     cleaner signal is the **within-run paired delta**: tick 1 (no lateral) vs
-     tick 2 (lateral), both captured per run in `tick_outputs`.
-   - **Cost-efficiency attribution is CONFOUNDED.** The mesh spends 8 calls
-     (ticks ≥ 2) vs the control's 4. Quality-per-call normalization assumes
-     linear quality scaling with calls, which is not guaranteed; a 2×-compute
-     mesh that wins quality-per-call is still ambiguous (lateral mechanism, or
-     just "a second look"?). No cost-efficiency claim until the equal-call
-     ablation lands. A future `sphere_x8_no_lateral` control (each sphere called
-     twice independently, no voting) would make the mechanism comparison
-     equal-call-count; it is on the roadmap for the scaled run.
-3. All quality comparisons are **blind-judge**, normalized by total inference
+2. **Mechanism activation (A2):** did lateral context perturb the receiving
+   columns? The within-run paired delta is tick 1 (no lateral) vs tick 2
+   (lateral), both captured per run in `tick_outputs`. This proves movement, not
+   benefit.
+3. **Mechanism quality attribution (A3):** did lateral context improve over an
+   equal-call second look? Compare `mesh_adaptive` final tick vs
+   `sphere_x4_second_look_no_lateral` final tick, matched by `prompt_id`,
+   `repeat_index`, and nonce. Both spend 8 calls; only one has neighbor text on
+   tick 2.
+4. All quality comparisons are **blind-judge**, normalized by total inference
    tokens and call count.
 
 ## Prompt set (pilot)
