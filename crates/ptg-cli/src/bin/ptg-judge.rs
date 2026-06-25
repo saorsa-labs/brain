@@ -117,6 +117,7 @@ struct AnswerRun {
     run_id: String,
     prompt_id: String,
     repeat_index: u32,
+    nonce: Option<u64>,
     parse_ok: bool,
     truncated: bool,
     ticks_run: Option<u32>,
@@ -127,7 +128,21 @@ struct AnswerRun {
 #[derive(Debug, Deserialize)]
 struct TickSnapshot {
     tick: u32,
+    #[serde(default)]
+    routes: Vec<RouteSnapshot>,
     outputs: Vec<CanonicalColumn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteSnapshot {
+    listener_id: String,
+    #[serde(default)]
+    sources: Vec<RoutedSourceSnapshot>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutedSourceSnapshot {
+    source_id: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -237,6 +252,33 @@ struct PairResult {
     llm_score_gap: Option<i64>,
 }
 
+/// A3 equal-call attribution pair: no-lateral second-look final vs lateral final.
+#[derive(Debug, Serialize)]
+struct A3PairResult {
+    mesh_run_id: String,
+    control_run_id: String,
+    prompt_id: String,
+    repeat_index: u32,
+    column_id: String,
+    mesh_determinism_ok: bool,
+    control_second_look_stable: bool,
+    mesh_echoed_neighbor: bool,
+    mesh_truncated: bool,
+    control_truncated: bool,
+    mesh_lateral_active: bool,
+    excluded: bool,
+    exclusion_reason: Option<String>,
+    /// Normalized Levenshtein distance between control final and mesh final.
+    prediction_edit_distance: Option<f64>,
+    /// Fraction of domain-field keys that differ between control final and mesh final.
+    domain_field_change_rate: Option<f64>,
+    /// Confidence delta (mesh lateral final − control no-lateral final). Self-reported only.
+    confidence_delta: Option<f64>,
+    /// Optional corroborating LLM verdict: tick_1 = second_look, tick_2 = lateral.
+    llm_winner_normalized: Option<String>,
+    llm_score_gap: Option<i64>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -289,6 +331,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ticks.iter().map(|t| (t.tick, &t.outputs)).collect();
         let tick1 = by_tick.get(&1);
         let tick2 = by_tick.get(&2);
+        let Some(tick2_snapshot) = ticks.iter().find(|t| t.tick == 2) else {
+            continue;
+        };
         let (Some(t1), Some(t2)) = (tick1, tick2) else {
             continue;
         };
@@ -304,9 +349,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // Echo screen against the ACTUAL injected neighbor (source) text, not
             // the receiver's own tick-1. Gather each source's tick-1 prediction.
-            let source_preds: Vec<&str> = sources_for(col_id)
+            let source_ids = source_ids_for_tick(tick2_snapshot, col_id);
+            let source_preds: Vec<&str> = source_ids
                 .iter()
-                .filter_map(|src| t1_map.get(*src))
+                .filter_map(|src| t1_map.get(src.as_str()))
                 .filter_map(|c| c.schema.get("prediction").and_then(Value::as_str))
                 .collect();
             let echoed = c2.lateral_active && echo_screen_against_sources(c2, &source_preds);
@@ -338,7 +384,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // LLM corroborating judge (only for non-excluded pairs, when enabled).
             let (llm_winner, llm_gap, calls_for_pair) = if !excluded {
                 if let Some((client, key)) = judge_client.as_ref() {
-                    rt.block_on(run_judge_pair(client, key, &args, run, col_id, c1, c2))?
+                    rt.block_on(run_judge_pair(
+                        client, key, &args, run, col_id, c1, c2, "a2",
+                    ))?
                 } else {
                     (None, None, Vec::new())
                 }
@@ -366,17 +414,233 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let mut a3_pairs = analyze_a3_pairs(&runs);
+    if let Some((client, key)) = judge_client.as_ref() {
+        for pair in a3_pairs.iter_mut().filter(|p| !p.excluded) {
+            let Some((control_col, mesh_col, mesh_run)) = find_a3_columns(&runs, pair) else {
+                continue;
+            };
+            let (winner, gap, calls) = rt.block_on(run_judge_pair(
+                client,
+                key,
+                &args,
+                mesh_run,
+                &pair.column_id,
+                control_col,
+                mesh_col,
+                "a3",
+            ))?;
+            pair.llm_winner_normalized = winner;
+            pair.llm_score_gap = gap;
+            judge_calls.extend(calls);
+        }
+    }
+
     // Write outputs.
-    let report = build_report(&args, &pairs);
+    let report = build_report(&args, &pairs, &a3_pairs);
     fs::write(&args.out, report)?;
     write_judge_calls(&args.calls_out, &judge_calls)?;
     eprintln!(
-        "analyzed {} pairs | wrote {} and {}",
+        "analyzed {} A2 pairs + {} A3 pairs | wrote {} and {}",
         pairs.len(),
+        a3_pairs.len(),
         args.out.display(),
         args.calls_out.display()
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A3 equal-call no-lateral second-look control
+// ---------------------------------------------------------------------------
+
+type RunKey = (String, u32, Option<u64>);
+type ColumnLookup<'a> = BTreeMap<&'a str, &'a CanonicalColumn>;
+
+fn run_key(run: &AnswerRun) -> RunKey {
+    (run.prompt_id.clone(), run.repeat_index, run.nonce)
+}
+
+fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
+    let mut controls: BTreeMap<RunKey, &AnswerRun> = BTreeMap::new();
+    for run in runs
+        .iter()
+        .filter(|r| r.condition == "sphere_x4_second_look_no_lateral")
+    {
+        controls.entry(run_key(run)).or_insert(run);
+    }
+
+    let mut pairs = Vec::new();
+    for mesh in runs.iter().filter(|r| r.condition == "mesh_adaptive") {
+        let Some(control) = controls.get(&run_key(mesh)).copied() else {
+            continue;
+        };
+        let Some((mesh_tick1, mesh_final)) = tick_pair_maps(mesh) else {
+            continue;
+        };
+        let Some((_, control_final)) = tick_pair_maps(control) else {
+            continue;
+        };
+        let Some(mesh_final_tick) = final_tick_snapshot(mesh) else {
+            continue;
+        };
+        let Some(control_final_tick) = final_tick_snapshot(control) else {
+            continue;
+        };
+        let two_tick_a3 = mesh_final_tick.tick == 2 && control_final_tick.tick == 2;
+        let Some(mesh_ticks) = &mesh.tick_outputs else {
+            continue;
+        };
+        let Some(control_ticks) = &control.tick_outputs else {
+            continue;
+        };
+        let mesh_determinism_ok = check_determinism(mesh_ticks);
+        let control_stable = second_look_stable(control_ticks);
+
+        for col_id in LATERAL_RECEIVERS {
+            let col_id: &str = col_id;
+            let (Some(mesh_col), Some(control_col)) =
+                (mesh_final.get(col_id), control_final.get(col_id))
+            else {
+                continue;
+            };
+            let source_ids = source_ids_for_tick(mesh_final_tick, col_id);
+            let source_preds: Vec<&str> = source_ids
+                .iter()
+                .filter_map(|src| mesh_tick1.get(src.as_str()))
+                .filter_map(|c| c.schema.get("prediction").and_then(Value::as_str))
+                .collect();
+            let echoed =
+                mesh_col.lateral_active && echo_screen_against_sources(mesh_col, &source_preds);
+            let mut excluded = false;
+            let mut reason = None;
+            if !mesh.parse_ok || !control.parse_ok {
+                excluded = true;
+                reason = Some("parse_failed".into());
+            } else if mesh.truncated {
+                excluded = true;
+                reason = Some("mesh_truncated".into());
+            } else if control.truncated {
+                excluded = true;
+                reason = Some("control_truncated".into());
+            } else if !mesh_determinism_ok {
+                excluded = true;
+                reason = Some("mesh_determinism_failed".into());
+            } else if !two_tick_a3 {
+                excluded = true;
+                reason = Some("non_two_tick_a3".into());
+            } else if !control_stable {
+                excluded = true;
+                reason = Some("control_second_look_unstable".into());
+            } else if !mesh_col.lateral_active {
+                excluded = true;
+                reason = Some("mesh_lateral_inactive".into());
+            } else if echoed {
+                excluded = true;
+                reason = Some("mesh_echoed_neighbor".into());
+            }
+
+            pairs.push(A3PairResult {
+                mesh_run_id: mesh.run_id.clone(),
+                control_run_id: control.run_id.clone(),
+                prompt_id: mesh.prompt_id.clone(),
+                repeat_index: mesh.repeat_index,
+                column_id: col_id.to_string(),
+                mesh_determinism_ok,
+                control_second_look_stable: control_stable,
+                mesh_echoed_neighbor: echoed,
+                mesh_truncated: mesh.truncated,
+                control_truncated: control.truncated,
+                mesh_lateral_active: mesh_col.lateral_active,
+                excluded,
+                exclusion_reason: reason,
+                prediction_edit_distance: if excluded {
+                    None
+                } else {
+                    prediction_edit_distance(control_col, mesh_col)
+                },
+                domain_field_change_rate: if excluded {
+                    None
+                } else {
+                    domain_field_change_rate(control_col, mesh_col)
+                },
+                confidence_delta: confidence_delta(control_col, mesh_col),
+                llm_winner_normalized: None,
+                llm_score_gap: None,
+            });
+        }
+    }
+    pairs
+}
+
+fn find_a3_columns<'a>(
+    runs: &'a [AnswerRun],
+    pair: &A3PairResult,
+) -> Option<(&'a CanonicalColumn, &'a CanonicalColumn, &'a AnswerRun)> {
+    let mesh = runs.iter().find(|r| r.run_id == pair.mesh_run_id)?;
+    let control = runs.iter().find(|r| r.run_id == pair.control_run_id)?;
+    let (_, mesh_final) = tick_pair_maps(mesh)?;
+    let (_, control_final) = tick_pair_maps(control)?;
+    let mesh_col = mesh_final.get(pair.column_id.as_str()).copied()?;
+    let control_col = control_final.get(pair.column_id.as_str()).copied()?;
+    Some((control_col, mesh_col, mesh))
+}
+
+fn source_ids_for_tick(tick: &TickSnapshot, listener_id: &str) -> Vec<String> {
+    if tick.routes.is_empty() {
+        return sources_for(listener_id)
+            .iter()
+            .map(|source| (*source).to_string())
+            .collect();
+    }
+    tick.routes
+        .iter()
+        .find(|route| route.listener_id == listener_id)
+        .map(|route| {
+            route
+                .sources
+                .iter()
+                .map(|source| source.source_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tick_pair_maps(run: &AnswerRun) -> Option<(ColumnLookup<'_>, ColumnLookup<'_>)> {
+    let ticks = run.tick_outputs.as_ref()?;
+    let first = ticks.iter().min_by_key(|t| t.tick)?;
+    let final_tick = ticks.iter().max_by_key(|t| t.tick)?;
+    if first.tick == final_tick.tick {
+        return None;
+    }
+    Some((column_map(&first.outputs), column_map(&final_tick.outputs)))
+}
+
+fn column_map(cols: &[CanonicalColumn]) -> ColumnLookup<'_> {
+    cols.iter().map(|c| (c.column_id.as_str(), c)).collect()
+}
+
+fn final_tick_snapshot(run: &AnswerRun) -> Option<&TickSnapshot> {
+    run.tick_outputs.as_ref()?.iter().max_by_key(|t| t.tick)
+}
+
+fn second_look_stable(ticks: &[TickSnapshot]) -> bool {
+    let Some(first) = ticks.iter().min_by_key(|t| t.tick) else {
+        return false;
+    };
+    let Some(final_tick) = ticks.iter().max_by_key(|t| t.tick) else {
+        return false;
+    };
+    if first.tick == final_tick.tick {
+        return false;
+    }
+    let final_map = column_map(&final_tick.outputs);
+    first.outputs.iter().all(|c1| {
+        final_map
+            .get(c1.column_id.as_str())
+            .map(|c2| canonical(&c1.schema) == canonical(&c2.schema))
+            .unwrap_or(false)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +779,7 @@ fn echo_screen_against_sources(c2: &CanonicalColumn, source_tick1_predictions: &
 // LLM corroborating judge
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_judge_pair(
     client: &reqwest::Client,
     api_key: &str,
@@ -523,6 +788,7 @@ async fn run_judge_pair(
     column_id: &str,
     c1: &CanonicalColumn,
     c2: &CanonicalColumn,
+    comparison: &str,
 ) -> Result<(Option<String>, Option<i64>, Vec<JudgeCallRecord>), Box<dyn std::error::Error>> {
     let mut calls = Vec::new();
     // Two judgments with swapped order.
@@ -532,7 +798,7 @@ async fn run_judge_pair(
     for (idx, (ta, tb)) in [order1, order2].iter().enumerate() {
         let (a, b) = if *ta == 1 { (c1, c2) } else { (c2, c1) };
         let pres = format!("tick{}_A_tick{}_B", ta, tb);
-        let call_id = format!("{}_{}_{}", run.run_id, column_id, idx);
+        let call_id = format!("{}_{}_{}_{}", comparison, run.run_id, column_id, idx);
         match judge_once(
             client,
             api_key,
@@ -587,7 +853,7 @@ async fn run_judge_pair(
                 && verdicts[1].1 != 0));
     if disagree && verdicts.len() == 2 {
         let (ta, tb) = (1u32, 2u32);
-        let call_id = format!("{}_{}_adj", run.run_id, column_id);
+        let call_id = format!("{}_{}_{}_adj", comparison, run.run_id, column_id);
         match judge_once(
             client,
             api_key,
@@ -852,7 +1118,7 @@ fn sphere_remit(column_id: &str) -> (&'static str, &'static str) {
 // Report
 // ---------------------------------------------------------------------------
 
-fn build_report(args: &Args, pairs: &[PairResult]) -> String {
+fn build_report(args: &Args, pairs: &[PairResult], a3_pairs: &[A3PairResult]) -> String {
     let mut s = String::new();
     s.push_str("# PTG Benchmark — A2 judge report\n\n");
     s.push_str(
@@ -1023,8 +1289,151 @@ fn build_report(args: &Args, pairs: &[PairResult]) -> String {
     s.push_str("- `confidence_delta` is self-reported → NON-evidence for quality or calibration (near-zero may be overconfidence ceiling).\n");
     s.push_str("- `determinism_ok` is per-run, `CC_PSYCH_01`-only; it does NOT establish cross-run determinism for the receiving columns.\n");
     s.push_str("- Echo-exclusion survivors may still be de-blinded by paraphrase; the survivor set may be biased toward columns that ignored lateral context.\n");
-    s.push_str("- A clean 'lateral IMPROVES' claim requires the A3 no-lateral-second-tick control (not yet built).\n");
+
+    append_a3_report(&mut s, args, a3_pairs);
     s
+}
+
+fn append_a3_report(s: &mut String, args: &Args, pairs: &[A3PairResult]) {
+    s.push_str("\n# A3 equal-call control — lateral vs no-lateral second look\n\n");
+    s.push_str("> **A3 scope: quality attribution at equal call budget.** tick_1 below means\n");
+    s.push_str("> `sphere_x4_second_look_no_lateral` final output; tick_2 means `mesh_adaptive`\n");
+    s.push_str("> final output. Both spend the same 2-tick / 8-call sphere budget; only tick_2\n");
+    s.push_str(
+        "> receives neighbor text. This answers whether lateral context beats a plain second pass.\n\n",
+    );
+    if pairs.is_empty() {
+        s.push_str(
+            "No A3 pairs found. Re-run `ptg-bench` with `sphere_x4_second_look_no_lateral` enabled.\n",
+        );
+        return;
+    }
+
+    s.push_str(&format!("- A3 pairs analyzed: {}\n", pairs.len()));
+    let excluded = pairs.iter().filter(|p| p.excluded).count();
+    s.push_str(&format!("- A3 excluded pairs: {}\n", excluded));
+    let unstable = pairs
+        .iter()
+        .filter(|p| !p.control_second_look_stable)
+        .count();
+    s.push_str(&format!(
+        "- No-lateral second-look unstable pairs: {} (should be 0 at temperature 0)\n",
+        unstable
+    ));
+
+    let mut exc: BTreeMap<String, i32> = BTreeMap::new();
+    for p in pairs {
+        if let Some(r) = &p.exclusion_reason {
+            *exc.entry(r.clone()).or_default() += 1;
+        }
+    }
+    s.push_str("\n## A3 exclusion breakdown\n\n");
+    if exc.is_empty() {
+        s.push_str("(none)\n");
+    } else {
+        for (k, v) in &exc {
+            s.push_str(&format!("- {k}: {v}\n"));
+        }
+    }
+
+    let scored: Vec<&A3PairResult> = pairs.iter().filter(|p| !p.excluded).collect();
+    s.push_str("\n## A3 programmatic delta (non-excluded)\n\n");
+    s.push_str(
+        "> Edit distance here is lateral-final vs no-lateral-second-look-final perturbation,\n",
+    );
+    s.push_str(
+        "> not quality. Quality requires the corroborating judge or an external evaluator.\n\n",
+    );
+    if scored.is_empty() {
+        s.push_str("(no non-excluded A3 pairs)\n");
+    } else {
+        s.push_str("| column | n | prediction edit dist (med) | domain-field change % (med) | mean conf delta (self-report, NON-evidence) |\n");
+        s.push_str("|---|---|---|---|---|\n");
+        for col in LATERAL_RECEIVERS {
+            let cs: Vec<&A3PairResult> = scored
+                .iter()
+                .copied()
+                .filter(|p| p.column_id == *col)
+                .collect();
+            if cs.is_empty() {
+                continue;
+            }
+            let mut ed: Vec<f64> = cs
+                .iter()
+                .filter_map(|p| p.prediction_edit_distance)
+                .collect();
+            ed.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut dfc: Vec<f64> = cs
+                .iter()
+                .filter_map(|p| p.domain_field_change_rate)
+                .collect();
+            dfc.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let cd: Vec<f64> = cs.iter().filter_map(|p| p.confidence_delta).collect();
+            s.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                col,
+                cs.len(),
+                fmt_median(&ed),
+                fmt_median(&dfc),
+                fmt_mean_signed(&cd)
+            ));
+        }
+    }
+
+    let judged: Vec<&A3PairResult> = scored
+        .iter()
+        .copied()
+        .filter(|p| p.llm_winner_normalized.is_some())
+        .collect();
+    s.push_str("\n## A3 corroborating: LLM judge (if run)\n\n");
+    if judged.is_empty() {
+        s.push_str(
+            "(A3 LLM judge not run — pass `--judge` and set the judge API key env var (default `GROQ_API_KEY`)\n",
+        );
+    } else {
+        s.push_str(&format!(
+            "- judge model: `{}` via `{}`\n",
+            args.judge_model, args.judge_api_url
+        ));
+        let mut wins: BTreeMap<String, i32> = BTreeMap::new();
+        for p in &judged {
+            if let Some(w) = &p.llm_winner_normalized {
+                let label = match w.as_str() {
+                    "tick_1" => "second_look",
+                    "tick_2" => "lateral",
+                    _ => "tie",
+                };
+                *wins.entry(label.to_string()).or_default() += 1;
+            }
+        }
+        s.push_str("- normalized winners: ");
+        s.push_str(&format!(
+            "{{ {} }}\n",
+            wins.iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        s.push_str(
+            "\n> If `lateral` does not beat `second_look`, scaling the current lateral-text exchange is premature.\n",
+        );
+    }
+}
+
+fn fmt_median(values: &[f64]) -> String {
+    if values.is_empty() {
+        String::from("—")
+    } else {
+        format!("{:.3}", values[values.len() / 2])
+    }
+}
+
+fn fmt_mean_signed(values: &[f64]) -> String {
+    if values.is_empty() {
+        String::from("—")
+    } else {
+        format!("{:+.3}", values.iter().sum::<f64>() / values.len() as f64)
+    }
 }
 
 fn write_judge_calls(
