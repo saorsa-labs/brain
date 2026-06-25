@@ -54,7 +54,9 @@ All generators run on the same model/server with identical generation settings
    default mesh run with the same `min_ticks/max_ticks` as `mesh_adaptive`, but
    lateral routing disabled (`k=0` source selection). This spends the same
    2-tick / 8-call budget as `mesh_adaptive` while keeping tick-2 prompts free of
-   neighbor text. It isolates lateral context from "the model got a second pass."
+   neighbor text. It controls for the **call-budget cost**, not for a genuine
+   revision pass — see the A3 scope caveats under "Quality" for exactly what this
+   does and does not isolate.
 
 3. **`sphere_x4_no_lateral`** — 1-tick / 4-call prompt-diversity control. The
    default mesh run with `max_ticks = 1`: 4 sphere-specialized column calls with
@@ -197,6 +199,32 @@ excluded from mechanism comparisons.
 second-look tick 2 without lateral context. This answers "did lateral context
 help more than just paying for a second pass?" It is still not a thesis-level
 consensus verdict because v0 has no explicit integrated consensus artifact.
+
+**A3 scope — what it does and does NOT control for.** The engine prompt carries
+no column history, and the control's lateral context is empty on *both* ticks, so
+at `temperature: 0` the control's tick-2 output is a **byte-identical replay** of
+its tick-1 (the judge enforces this via the `control_second_look_unstable`
+exclusion). Two consequences:
+
+- A3 controls for **call budget / compute**, not for a genuine *revision* pass.
+  The honest scope of a positive A3 result is therefore *"at equal call budget,
+  injected lateral text changes/improves the output versus an empty-context
+  replay."* It does **not** establish that lateral exchange beats any other way of
+  spending the same compute — e.g. a self-reflection / "reconsider your answer"
+  pass is a different control (A4) and is **not yet built**. Do not phrase A3
+  results as "the cortical mechanism beats a second look" without that A4 control.
+- Because the control's second tick is an inert replay, `control_final` is
+  **byte-identical to `sphere_x4_no_lateral`'s output** (both are the single-pass
+  specialized answer). This is expected, not a duplication bug; A3's value over
+  the 1-tick control is purely (a) budget-matched token/cost accounting and
+  (b) explicitly refuting the "it just got more calls" objection.
+
+**Precondition for a non-empty A3 report.** A3 only yields pairs when *both* arms
+actually run 2 ticks; otherwise every pair is dropped as `non_two_tick_a3` and the
+report is empty. With high model confidence and `min_ticks = 1`, an arm can
+converge (MeanConfidence) and stop at tick 1 / 4 calls. **Run the live A3 bench
+with `--min-ticks 2 --max-ticks 2`.** The code fails safe (excludes rather than
+mis-reports), but a misconfigured run burns compute and produces zero pairs.
 
 Comparisons are deliberately separated into three questions:
 
