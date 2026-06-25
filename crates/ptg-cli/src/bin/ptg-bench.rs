@@ -31,7 +31,7 @@ use ptg_core::{
     ColumnOutputSchema, Stimulus, PROMPT_CODING, PROMPT_MATHEMATICS, PROMPT_PHYSICS,
     PROMPT_PSYCHOLOGY,
 };
-use ptg_runtime::{default_mesh, TickOutputs};
+use ptg_runtime::{default_mesh, RoutingPolicy, TickOutputs};
 use ptg_vllm::{CollectorSink, EngineCallMetrics, InferenceEngine, MetricsSink};
 use serde::Serialize;
 
@@ -66,6 +66,34 @@ impl Condition {
             Self::MonoAllPrompts => "mono_all_prompts",
             Self::MonoX4 => "mono_x4",
             Self::SphereX4NoLateral => "sphere_x4_no_lateral",
+        }
+    }
+}
+
+/// CLI mirror of [`RoutingPolicy`] (§9.1). Only affects `mesh_adaptive`; the
+/// 1-tick control and monolithic conditions have no lateral exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum RoutingKind {
+    All,
+    ConfidenceTopK,
+    Diversity,
+}
+
+impl RoutingKind {
+    fn to_policy(self, k: usize) -> RoutingPolicy {
+        match self {
+            Self::All => RoutingPolicy::All,
+            Self::ConfidenceTopK => RoutingPolicy::ConfidenceTopK { k },
+            Self::Diversity => RoutingPolicy::DiversityPreserving { k },
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::ConfidenceTopK => "confidence-top-k",
+            Self::Diversity => "diversity",
         }
     }
 }
@@ -112,6 +140,15 @@ struct Args {
     /// Skip the measured runs; just print the plan and prompt set (wiring check).
     #[arg(long)]
     dry_run: bool,
+    /// Lateral routing policy for `mesh_adaptive` (§9.1). `all` (default, V1)
+    /// injects every neighbor; `confidence-top-k` injects the k highest-
+    /// confidence; `diversity` diversity-preserving (MMR) selection that keeps
+    /// dissimilar frames. Only affects `mesh_adaptive`.
+    #[arg(long, value_enum, default_value_t = RoutingKind::All)]
+    routing_policy: RoutingKind,
+    /// Source budget for `confidence-top-k` / `diversity` (default 2).
+    #[arg(long, default_value_t = 2)]
+    routing_k: usize,
 }
 
 /// One answer-producing run.
@@ -159,6 +196,10 @@ struct AnswerRunRecord {
     /// Confidence threshold used for the accepted/rejected split (recorded so
     /// the C4 ablation is self-contained). `None` for non-mesh conditions.
     integration_threshold: Option<f32>,
+    /// Routing policy applied to the mesh (`"all"` for monolithic / 1-tick
+    /// controls where lateral exchange never runs). Recorded so routing-policy
+    /// comparisons are reproducible (§9.1).
+    routing_policy: String,
     parse_ok: bool,
     error: Option<String>,
     per_call: Vec<EngineCallMetrics>,
@@ -215,6 +256,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  repeats: {}, ticks: min={} max={}, seed: {}",
             args.repeats, args.min_ticks, args.max_ticks, args.seed
+        );
+        eprintln!(
+            "  routing: {}{} (mesh_adaptive only)",
+            args.routing_policy.label(),
+            if args.routing_policy == RoutingKind::All {
+                String::new()
+            } else {
+                format!(" k={}", args.routing_k)
+            }
         );
         let mono_disp = args.max_tokens_mono.map_or_else(
             || {
@@ -401,6 +451,7 @@ async fn run_one(
         accepted_count: None,
         rejected_count: None,
         integration_threshold: None,
+        routing_policy: cond_routing_label(cond, args),
         parse_ok: false,
         error: None,
         per_call: Vec::new(),
@@ -467,6 +518,7 @@ async fn run_mesh(
     let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
     mesh.criteria.max_ticks = args.max_ticks;
     mesh.criteria.min_ticks = args.min_ticks;
+    mesh.routing_policy = args.routing_policy.to_policy(args.routing_k);
     let threshold = mesh.criteria.min_integration_confidence;
     // Columns that RECEIVE lateral context (have at least one neighbor).
     // In the default topology this is {PHYSICS, MATH, CODE}; PSYCH listens to
@@ -592,10 +644,23 @@ fn canonical_column(
     })
 }
 
+/// Routing-policy label for a condition's record. Monolithic and 1-tick
+/// controls never exercise lateral exchange, so they are labelled `"all"`
+/// (the V1 default) for reproducibility regardless of `--routing-policy`.
+fn cond_routing_label(cond: Condition, args: &Args) -> String {
+    match cond {
+        Condition::MeshAdaptive => args.routing_policy.label().to_string(),
+        _ => "all".to_string(),
+    }
+}
+
 /// Canonicalize every executed tick's outputs into a JSON array, one entry per
-/// tick, in execution order. Each entry is `{tick, outputs: [canonical_column...]}`.
-/// This gives downstream analysis the within-run mechanism signal: tick 1 (no
-/// lateral context) vs tick 2 (lateral context injected).
+/// tick, in execution order. Each entry is `{tick, routes, outputs}` where
+/// `routes` is the lateral routing decisions used to build that tick's prompts
+/// (§9.1 observability) and `outputs` is per-column results. This gives
+/// downstream analysis the within-run mechanism signal: tick 1 (no lateral
+/// context) vs tick 2 (lateral context injected), plus which neighbors each
+/// column actually heard from and at what weight.
 fn canonical_ticks(
     ticks: &[TickOutputs],
     threshold: f32,
@@ -611,7 +676,28 @@ fn canonical_ticks(
                     canonical_column(id, schema, threshold, lateral_active(t.tick, id, receivers))
                 })
                 .collect();
-            serde_json::json!({ "tick": t.tick, "outputs": cols })
+            let routes: Vec<serde_json::Value> = t
+                .routes
+                .iter()
+                .map(|dec| {
+                    let sources: Vec<serde_json::Value> = dec
+                        .sources
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "source_id": s.source_id,
+                                "weight": s.weight,
+                                "confidence": s.confidence,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "listener_id": dec.listener_id,
+                        "sources": sources,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "tick": t.tick, "routes": routes, "outputs": cols })
         })
         .collect()
 }
