@@ -53,15 +53,25 @@ quality? Methodology is committed in [`docs/BENCHMARKING.md`](./BENCHMARKING.md)
 pilot first (5 prompts × 3 repeats), scale to ~50+ only if the harness and
 compute-matched controls pass review. No headline quality claim until then.
 
-- [ ] Committed methodology doc + fair-baseline design (C1–C4 confounds neutralized).
-- [ ] Instrument the engine for per-call `usage` (incl. `cached_tokens`) +
+- [x] Committed methodology doc + fair-baseline design (C1–C4 confounds neutralized).
+- [x] Instrument the engine for per-call `usage` (incl. `cached_tokens`) +
       `finish_reason`, without changing the `ColumnEngine` trait.
-- [ ] `ptg-bench` harness: `mesh_adaptive` / `mono_all_prompts` / `mono_x4`;
-      JSONL raw records + Markdown summary.
-- [ ] Pilot run against `gemma-4-e4b`; record results (pilot-only, no headline).
-- [ ] Scale to ~50+ prompts + paired statistics if pilot is sound.
+- [x] `ptg-bench` harness: `mesh_adaptive` / `sphere_x4_no_lateral` / `mono_all_prompts` /
+      `mono_x4`; JSONL raw records + Markdown summary. `--routing-policy` + per-tick
+      route observability wired.
+- [x] Pilot run against `gemma-4-e2b-qat` (5 prompts × 3 repeats × 4 conditions).
+      Results recorded in [`PILOT_FINDINGS.md`](./PILOT_FINDINGS.md) (pilot-only,
+      no headline). Key signals: mesh costs 3–4.5× compute with quality *unmeasured*;
+      cache-hit collapses under lateral exchange (43.5% vs 98%+); homogenization
+      lead from v0.2.0 does not replicate strongly at pilot scale.
+- [ ] **Quality pass: run `ptg-judge` on the pilot outputs.** The missing half —
+      latency/token numbers are meaningless without knowing if the mesh produces
+      *better* answers. This is the highest-information unblocked move.
+- [ ] Scale to ~50+ prompts + paired statistics (median/CI/σ) if the quality pass
+      is sound. The homogenization comparison needs statistical power to become
+      evidence rather than a lead.
 
-## Phase 3 — Topologies & convergence depth (in progress)
+## Phase 3 — Topologies & convergence depth ✅ (unblocked items done)
 
 - [~] Pluggable topologies: ring, torus, small-world (§3.1.3). **Library +
       runtime + CLI `--topology` flag landed.** `TopologySpec` in `ptg-core`, `mesh_with_topology` in `ptg-runtime`, `--topology/--columns` in `ptg`. Bench `--topology` flag deferred until a topology-aware benchmark is wired.
