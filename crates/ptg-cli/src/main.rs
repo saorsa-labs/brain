@@ -9,14 +9,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
-use ptg_core::{
-    replicated_default_columns, CorticalColumn, ImageDetail, ImageUrlRef, LateralConnection,
-    Stimulus, TopologySpec,
-};
+use ptg_core::{ImageDetail, ImageUrlRef, Stimulus};
 use ptg_runtime::{default_mesh, mesh_from_columns};
 use ptg_vllm::{list_models, ColumnEngine, InferenceEngine};
 
-mod column_pack;
+use ptg_cli::topology_cli::{MeshPlan, MeshTopologyParams, TopologyKind};
 
 /// Default stimulus from the reference wiring (§8.4).
 const DEFAULT_INPUT: &str = "Anomalous kinetic energy burst detected tracking at vector [4, 12, -2]. Script automation system failed initialization step.";
@@ -142,53 +139,6 @@ struct Cli {
     routing_k: usize,
 }
 
-/// Selectable lateral topologies for `--topology`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "kebab-case")]
-enum TopologyKind {
-    /// Named 4-column reference graph (§8.4), unchanged.
-    Default,
-    /// Directed 1-D cycle: each column listens to its predecessor.
-    Ring,
-    /// Bidirectional ring: each column listens to predecessor + successor.
-    /// Requires >= 4 columns (for n<=3 it collapses to the complete graph).
-    RingBi,
-    /// 2-D wraparound grid: each column listens to its four cardinal neighbors.
-    Torus,
-    /// Every column listens to every other.
-    FullyConnected,
-    /// Seeded Watts-Strogatz small-world (deterministic given `--small-world-seed`).
-    SmallWorld,
-}
-
-/// A fully-materialized topology plan: the columns plus the listener->source edge
-/// list, plus a human label. Built by [`topology_plan`]; `None` means "use the
-/// default reference mesh".
-#[derive(Debug)]
-struct MeshPlan {
-    columns: Vec<CorticalColumn>,
-    connections: Vec<LateralConnection>,
-    /// Optional abstraction-level tag per column (parallel to `columns`),
-    /// populated from a column pack's `level` field; empty for replicated
-    /// defaults. Surfaced in `--dry-run` for experiment attribution.
-    levels: Vec<Option<u8>>,
-    label: String,
-}
-
-impl TopologyKind {
-    /// The kebab-case flag value the user would type (for error messages).
-    fn kebab(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Ring => "ring",
-            Self::RingBi => "ring-bi",
-            Self::Torus => "torus",
-            Self::FullyConnected => "fully-connected",
-            Self::SmallWorld => "small-world",
-        }
-    }
-}
-
 /// CLI mirror of [`ptg_runtime::RoutingPolicy`] (§9.1). `All` is the default and
 /// preserves V1 behavior; the other two take a budget `k` via `--routing-k`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -222,191 +172,20 @@ impl RoutingPolicyKind {
     }
 }
 
-/// The four named ids of the reference 4-column mesh, in any order.
-fn expected_default_ids() -> &'static [&'static str] {
-    &["CC_PHYSICS_01", "CC_MATH_01", "CC_CODE_01", "CC_PSYCH_01"]
-}
-
-/// Validate that a pack reproduces the named reference graph (by id, order-
-/// independent) so `--topology default --column-pack` is the same wiring as
-/// `default_mesh`.
-///
-/// # Errors
-/// `Err(String)` if the pack id set is not exactly the four reference ids.
-fn validate_default_pack_ids(columns: &[CorticalColumn]) -> Result<(), String> {
-    let mut have: Vec<&str> = columns.iter().map(|c| c.id.as_str()).collect();
-    have.sort_unstable();
-    let mut want: Vec<&str> = expected_default_ids().to_vec();
-    want.sort_unstable();
-    if have == want {
-        Ok(())
-    } else {
-        Err(format!(
-            "--topology default with --column-pack requires exactly these ids \n(order-independent): {}\n(pack has: {})",
-            expected_default_ids().join(", "),
-            columns.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
-        ))
-    }
-}
-
-/// The reference 4-column lateral edges as `LateralConnection`s.
-/// `default_connections()` tuples are `(listener, source)` (the listener
-/// receives the source's prediction); the conversion preserves that direction.
-fn default_reference_edges() -> Vec<LateralConnection> {
-    ptg_core::default_connections()
-        .into_iter()
-        .map(|(listener, source)| LateralConnection::new(listener, source))
-        .collect()
-}
-
-/// Resolve the column count from `--columns`, or for torus from the grid dims.
-/// Errors with a friendly message naming the topology.
-fn resolve_columns(cli: &Cli) -> Result<usize, String> {
-    if cli.topology == TopologyKind::Torus {
-        let w = cli
-            .torus_width
-            .ok_or_else(|| "--topology torus requires --torus-width".to_string())?;
-        let h = cli
-            .torus_height
-            .ok_or_else(|| "--topology torus requires --torus-height".to_string())?;
-        let derived = w * h;
-        if let Some(requested) = cli.columns {
-            if requested != derived {
-                return Err(format!(
-                    "--columns {requested} != --torus-width {w} * --torus-height {h} ({derived})"
-                ));
-            }
-        }
-        return Ok(derived);
-    }
-    cli.columns
-        .ok_or_else(|| format!("--topology {} requires --columns", cli.topology.kebab()))
-}
-
-/// Build a topology plan from the CLI flags. Returns `Ok(None)` for
-/// [`TopologyKind::Default`] (the caller uses [`default_mesh`]); returns an
-/// error string on any validation failure (degeneracy guardrails are stricter
-/// than the library minimums, to keep generated graphs meaningful).
+/// Resolve the topology plan from this CLI's flags. Delegates to the shared
+/// [`ptg_cli::topology_cli`] resolver so `ptg` and `ptg-bench` cannot drift on
+/// column-count / small-world-degree validation.
 fn topology_plan(cli: &Cli) -> Result<Option<MeshPlan>, String> {
-    if cli.topology == TopologyKind::Default {
-        return match &cli.column_pack {
-            None => Ok(None),
-            Some(path) => {
-                // A pack + default topology is only valid if it reproduces the
-                // named 4-column reference graph exactly (by id; order-independent).
-                let cols = column_pack::load_column_pack_with_levels(path)?;
-                let (columns, levels): (Vec<_>, Vec<_>) = cols.into_iter().unzip();
-                validate_default_pack_ids(&columns)?;
-                let connections = default_reference_edges();
-                Ok(Some(MeshPlan {
-                    columns,
-                    connections,
-                    levels,
-                    label: "default (from pack)".to_string(),
-                }))
-            }
-        };
-    }
-    let n = resolve_columns(cli)?;
-
-    // CLI-level degeneracy guardrails (stricter than the library minimums).
-    match cli.topology {
-        TopologyKind::Default => {}
-        TopologyKind::Ring if n < 2 => {
-            return Err("--topology ring requires --columns >= 2".to_string());
-        }
-        TopologyKind::RingBi if n < 4 => {
-            // For n<=3 a bidirectional ring collapses to the complete graph.
-            return Err(
-                "--topology ring-bi requires --columns >= 4 (else it == fully-connected)"
-                    .to_string(),
-            );
-        }
-        TopologyKind::FullyConnected if n < 2 => {
-            return Err("--topology fully-connected requires --columns >= 2".to_string());
-        }
-        TopologyKind::SmallWorld if cli.small_world_degree * 2 >= n => {
-            // degree ≪ n is required for Watts-Strogatz to behave as intended;
-            // near n it silently under-rewires (red-team finding).
-            return Err(format!(
-                "--topology small-world requires --small-world-degree * 2 < --columns \n(got degree {}, columns {})",
-                cli.small_world_degree, n
-            ));
-        }
-        _ => {}
-    }
-
-    let columns_levels: Vec<Option<u8>>;
-    let columns = match &cli.column_pack {
-        Some(path) => {
-            let pack = column_pack::load_column_pack_with_levels(path)?;
-            if pack.len() != n {
-                return Err(format!(
-                    "--column-pack has {} column(s) but topology expects {n} \n(derive via --columns or --torus-width/--torus-height)",
-                    pack.len()
-                ));
-            }
-            let (columns, levels): (Vec<_>, Vec<_>) = pack.into_iter().unzip();
-            columns_levels = levels;
-            columns
-        }
-        None => {
-            columns_levels = vec![None; n];
-            replicated_default_columns(n)
-        }
-    };
-    let ids: Vec<String> = columns.iter().map(|c| c.id.clone()).collect();
-    let (spec, label) = match cli.topology {
-        TopologyKind::Default => {
-            // `Default` is dispatched and returned earlier in `topology_plan`
-            // (it never reaches this second match). Surface as an error rather
-            // than panic, per the panic-free policy.
-            return Err(
-                "internal: Default topology should be handled before topology dispatch".to_string(),
-            );
-        }
-        TopologyKind::Ring => (
-            TopologySpec::Ring {
-                bidirectional: false,
-            },
-            "ring",
-        ),
-        TopologyKind::RingBi => (
-            TopologySpec::Ring {
-                bidirectional: true,
-            },
-            "ring-bi",
-        ),
-        TopologyKind::Torus => {
-            let w = cli.torus_width.unwrap_or(0);
-            let h = cli.torus_height.unwrap_or(0);
-            (
-                TopologySpec::Torus2d {
-                    width: w,
-                    height: h,
-                },
-                "torus",
-            )
-        }
-        TopologyKind::FullyConnected => (TopologySpec::FullyConnected, "fully-connected"),
-        TopologyKind::SmallWorld => (
-            TopologySpec::SmallWorld {
-                degree: cli.small_world_degree,
-                rewire_probability: cli.small_world_rewire,
-                seed: cli.small_world_seed,
-            },
-            "small-world",
-        ),
-    };
-    let connections = spec
-        .connections_for(&ids)
-        .map_err(|e| format!("{label}: {e}"))?;
-    Ok(Some(MeshPlan {
-        columns,
-        connections,
-        levels: columns_levels,
-        label: label.to_string(),
-    }))
+    ptg_cli::topology_cli::topology_plan(&MeshTopologyParams {
+        topology: cli.topology,
+        columns: cli.columns,
+        torus_width: cli.torus_width,
+        torus_height: cli.torus_height,
+        small_world_degree: cli.small_world_degree,
+        small_world_rewire: cli.small_world_rewire,
+        small_world_seed: cli.small_world_seed,
+        column_pack: cli.column_pack.clone(),
+    })
 }
 
 fn main() -> ExitCode {

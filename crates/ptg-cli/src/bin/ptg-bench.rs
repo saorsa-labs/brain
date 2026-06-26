@@ -30,11 +30,12 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use ptg_cli::topology_cli::{MeshTopologyParams, TopologyKind};
 use ptg_core::{
     ColumnOutputSchema, Stimulus, PROMPT_CODING, PROMPT_MATHEMATICS, PROMPT_PHYSICS,
     PROMPT_PSYCHOLOGY,
 };
-use ptg_runtime::{default_mesh, RoutingPolicy, TickOutputs};
+use ptg_runtime::{default_mesh, mesh_from_columns, RoutingPolicy, TickOutputs};
 use ptg_vllm::{CollectorSink, EngineCallMetrics, InferenceEngine, MetricsSink};
 use serde::Serialize;
 
@@ -74,6 +75,26 @@ impl Condition {
             Self::SphereX4NoLateral => "sphere_x4_no_lateral",
             Self::SphereX4SecondLookNoLateral => "sphere_x4_second_look_no_lateral",
         }
+    }
+
+    /// Parse a condition label (for `--conditions a,b,c`).
+    fn from_label(s: &str) -> Option<Self> {
+        Some(match s {
+            "mesh_adaptive" => Self::MeshAdaptive,
+            "mono_all_prompts" => Self::MonoAllPrompts,
+            "mono_x4" => Self::MonoX4,
+            "sphere_x4_no_lateral" => Self::SphereX4NoLateral,
+            "sphere_x4_second_look_no_lateral" => Self::SphereX4SecondLookNoLateral,
+            _ => return None,
+        })
+    }
+
+    /// Mesh-style conditions run the cortical mesh (vs. the monolithic baselines).
+    const fn is_mesh(self) -> bool {
+        matches!(
+            self,
+            Self::MeshAdaptive | Self::SphereX4NoLateral | Self::SphereX4SecondLookNoLateral
+        )
     }
 }
 
@@ -144,6 +165,41 @@ struct Args {
     /// Run only one condition (default: all three).
     #[arg(long, value_enum)]
     only: Option<Condition>,
+    /// Comma-separated subset of conditions to run (labels, e.g.
+    /// `mesh_adaptive,sphere_x4_second_look_no_lateral`). Overrides `--only`.
+    #[arg(long, value_delimiter = ',')]
+    conditions: Option<Vec<String>>,
+    /// Run only the first N benchmark prompts (scale smoke / fast iteration).
+    #[arg(long)]
+    prompt_limit: Option<usize>,
+    /// Topology family for mesh-style conditions. `default` = named 4-column
+    /// reference graph; the others are built over `--columns` replicated
+    /// spheres. For non-`default`, monolithic conditions are rejected (a
+    /// many-prompt monolith is not a fair baseline).
+    #[arg(long, value_enum, default_value_t = TopologyKind::Default)]
+    topology: TopologyKind,
+    /// Number of columns for a generated topology (ignored for `default`).
+    #[arg(long)]
+    columns: Option<usize>,
+    /// Torus grid width (required for `--topology torus`).
+    #[arg(long)]
+    torus_width: Option<usize>,
+    /// Torus grid height (required for `--topology torus`).
+    #[arg(long)]
+    torus_height: Option<usize>,
+    /// Small-world ring-lattice out-degree (even).
+    #[arg(long, default_value_t = 4)]
+    small_world_degree: usize,
+    /// Small-world edge rewire probability in `[0, 1]`.
+    #[arg(long, default_value_t = 0.10)]
+    small_world_rewire: f64,
+    /// Small-world PRNG seed (same seed => same graph).
+    #[arg(long, default_value_t = 42)]
+    small_world_seed: u64,
+    /// Optional column pack (overrides replicated defaults for a generated
+    /// topology; count must equal `--columns`).
+    #[arg(long = "column-pack", value_name = "PATH")]
+    column_pack: Option<PathBuf>,
     /// Skip the measured runs; just print the plan and prompt set (wiring check).
     #[arg(long)]
     dry_run: bool,
@@ -207,6 +263,12 @@ struct AnswerRunRecord {
     /// controls where lateral exchange never runs). Recorded so routing-policy
     /// comparisons are reproducible (§9.1).
     routing_policy: String,
+    /// Topology label (`"default"`, `"ring"`, `"small-world"`, ...).
+    topology: String,
+    /// Number of columns in the mesh (`None` for monolithic conditions).
+    column_count: Option<u32>,
+    /// Number of lateral edges in the mesh (`None` for monolithic conditions).
+    edge_count: Option<u32>,
     parse_ok: bool,
     error: Option<String>,
     per_call: Vec<EngineCallMetrics>,
@@ -237,17 +299,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let conditions: Vec<Condition> = match args.only {
-        Some(c) => vec![c],
-        None => vec![
-            Condition::MeshAdaptive,
-            Condition::SphereX4SecondLookNoLateral,
-            Condition::SphereX4NoLateral,
-            Condition::MonoAllPrompts,
-            Condition::MonoX4,
-        ],
+    let conditions: Vec<Condition> = if let Some(labels) = &args.conditions {
+        let mut out = Vec::new();
+        for l in labels {
+            let l = l.trim();
+            let c = Condition::from_label(l).ok_or_else(|| {
+                format!("unknown condition `{l}`; valid: mesh_adaptive, sphere_x4_second_look_no_lateral, sphere_x4_no_lateral, mono_all_prompts, mono_x4")
+            })?;
+            out.push(c);
+        }
+        if out.is_empty() {
+            return Err("--conditions requires at least one label".into());
+        }
+        out
+    } else {
+        match args.only {
+            Some(c) => vec![c],
+            None => vec![
+                Condition::MeshAdaptive,
+                Condition::SphereX4SecondLookNoLateral,
+                Condition::SphereX4NoLateral,
+                Condition::MonoAllPrompts,
+                Condition::MonoX4,
+            ],
+        }
     };
-    let prompts = default_prompts();
+    // Non-default topologies only support mesh-style conditions: a monolithic
+    // baseline over a generated multi-column prompt set is not a fair control.
+    if args.topology != TopologyKind::Default {
+        for c in &conditions {
+            if !c.is_mesh() {
+                return Err(format!(
+                    "condition `{}` is not valid for --topology {}; select mesh-style conditions via --conditions",
+                    c.label(),
+                    args.topology.kebab()
+                )
+                .into());
+            }
+        }
+    }
+    let all_prompts = default_prompts();
+    let prompts: Vec<(String, String)> = match args.prompt_limit {
+        Some(n) => all_prompts.into_iter().take(n).collect(),
+        None => all_prompts,
+    };
 
     if args.dry_run {
         eprintln!("ptg-bench DRY RUN");
@@ -264,6 +359,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  repeats: {}, ticks: min={} max={}, seed: {}",
             args.repeats, args.min_ticks, args.max_ticks, args.seed
+        );
+        let (topo_label, cols, edges) = mesh_meta(&args);
+        eprintln!(
+            "  topology: {topo_label} (cols={:?}, edges={:?})",
+            cols, edges
         );
         eprintln!(
             "  routing: {}{} (mesh_adaptive only)",
@@ -428,6 +528,9 @@ async fn run_one(
     let _ = sink.drain();
     let wall_start = Instant::now();
 
+    // Topology metadata (cheap; resolves the plan without touching the engine).
+    let (topology_label, column_count, edge_count) = mesh_meta(args);
+
     let mut rec = AnswerRunRecord {
         record_type: "answer_run",
         schema_version: 1,
@@ -460,6 +563,9 @@ async fn run_one(
         rejected_count: None,
         integration_threshold: None,
         routing_policy: cond_routing_label(cond, args),
+        topology: String::new(),
+        column_count: None,
+        edge_count: None,
         parse_ok: false,
         error: None,
         per_call: Vec::new(),
@@ -478,12 +584,15 @@ async fn run_one(
         Condition::SphereX4SecondLookNoLateral => {
             run_mesh_second_look_no_lateral(mesh_engine, &stimulus, args).await
         }
-        Condition::SphereX4NoLateral => run_mesh_one_tick(mesh_engine, &stimulus).await,
+        Condition::SphereX4NoLateral => run_mesh_one_tick(mesh_engine, &stimulus, args).await,
         Condition::MonoAllPrompts => run_mono_once(mono_engine, &stimulus).await,
         Condition::MonoX4 => run_mono_x4(mono_engine, &stimulus).await,
     };
     let wall = wall_start.elapsed().as_millis() as u64;
     rec.wall_latency_ms = wall;
+    rec.topology = topology_label;
+    rec.column_count = column_count;
+    rec.edge_count = edge_count;
 
     let calls = sink.drain();
     aggregate_metrics(&mut rec, &calls);
@@ -521,12 +630,59 @@ struct MeshExtras {
     tick_outputs: Option<Vec<serde_json::Value>>,
 }
 
+/// Collect this CLI's topology flags into the shared resolver input.
+fn mesh_topology_params(args: &Args) -> MeshTopologyParams {
+    MeshTopologyParams {
+        topology: args.topology,
+        columns: args.columns,
+        torus_width: args.torus_width,
+        torus_height: args.torus_height,
+        small_world_degree: args.small_world_degree,
+        small_world_rewire: args.small_world_rewire,
+        small_world_seed: args.small_world_seed,
+        column_pack: args.column_pack.clone(),
+    }
+}
+
+/// Build the mesh this run uses: the named reference graph for `--topology default`
+/// (without a column pack), otherwise a generated topology resolved through the
+/// shared `ptg_cli::topology_cli` resolver.
+fn build_mesh(
+    engine: Arc<dyn ptg_vllm::ColumnEngine>,
+    args: &Args,
+) -> Result<ptg_runtime::CorticalMesh, String> {
+    if args.topology == TopologyKind::Default && args.column_pack.is_none() {
+        return default_mesh(engine).map_err(|e| e.to_string());
+    }
+    let plan = ptg_cli::topology_cli::topology_plan(&mesh_topology_params(args))?
+        .ok_or_else(|| "internal: generated topology resolved to None".to_string())?;
+    mesh_from_columns(engine, plan.columns, plan.connections).map_err(|e| e.to_string())
+}
+
+/// Resolve topology metadata (label / columns / edges) without building the
+/// engine-backed mesh. Used to annotate records even for monolithic conditions.
+fn mesh_meta(args: &Args) -> (String, Option<u32>, Option<u32>) {
+    match ptg_cli::topology_cli::topology_plan(&mesh_topology_params(args)) {
+        Ok(Some(plan)) => (
+            plan.label,
+            Some(plan.columns.len() as u32),
+            Some(plan.connections.len() as u32),
+        ),
+        Ok(None) => (
+            "default".to_string(),
+            Some(4),
+            Some(ptg_core::default_connections().len() as u32),
+        ),
+        Err(_) => (args.topology.kebab().to_string(), None, None),
+    }
+}
+
 async fn run_mesh(
     engine: &Arc<dyn ptg_vllm::ColumnEngine>,
     stimulus: &Stimulus,
     args: &Args,
 ) -> Result<(serde_json::Value, MeshExtras), String> {
-    let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
+    let mut mesh = build_mesh(engine.clone(), args)?;
     mesh.criteria.max_ticks = args.max_ticks;
     mesh.criteria.min_ticks = args.min_ticks;
     mesh.routing_policy = args.routing_policy.to_policy(args.routing_k);
@@ -560,7 +716,7 @@ async fn run_mesh_second_look_no_lateral(
     stimulus: &Stimulus,
     args: &Args,
 ) -> Result<(serde_json::Value, MeshExtras), String> {
-    let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
+    let mut mesh = build_mesh(engine.clone(), args)?;
     mesh.criteria.max_ticks = args.max_ticks;
     mesh.criteria.min_ticks = args.min_ticks;
     disable_lateral_context(&mut mesh);
@@ -591,14 +747,15 @@ fn disable_lateral_context(mesh: &mut ptg_runtime::CorticalMesh) {
     mesh.routing_policy = RoutingPolicy::ConfidenceTopK { k: 0 };
 }
 
-/// `sphere_x4_no_lateral` — the 1-tick no-voting control. Runs the default mesh
-/// with `max_ticks = 1`: 4 sphere-specialized column calls, empty lateral
-/// context (no prior ticks), no voting/convergence.
+/// `sphere_x4_no_lateral` — the 1-tick no-voting control. Runs the mesh with
+/// `max_ticks = 1`: sphere-specialized column calls, empty lateral context (no
+/// prior ticks), no voting/convergence.
 async fn run_mesh_one_tick(
     engine: &Arc<dyn ptg_vllm::ColumnEngine>,
     stimulus: &Stimulus,
+    args: &Args,
 ) -> Result<(serde_json::Value, MeshExtras), String> {
-    let mut mesh = default_mesh(engine.clone()).map_err(|e| e.to_string())?;
+    let mut mesh = build_mesh(engine.clone(), args)?;
     mesh.criteria.max_ticks = 1;
     let threshold = mesh.criteria.min_integration_confidence;
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
@@ -834,6 +991,11 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
     let mut s = String::new();
     s.push_str("# PTG Benchmark — pilot run\n\n");
     s.push_str(&format!("- Generated (unix ms): {ts}\n"));
+    let (topo_label, cols, edges) = mesh_meta(args);
+    s.push_str(&format!(
+        "- Topology: `{}` (columns={:?}, edges={:?})\n",
+        topo_label, cols, edges
+    ));
     s.push_str(&format!(
         "- Server: `{}`  Model: `{}`\n",
         args.vllm_url, args.model

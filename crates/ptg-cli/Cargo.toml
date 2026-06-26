@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 description = "Command-line entry point for Project Thousand-Gemma."
 
+[lib]
+name = "ptg_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ptg"
 path = "src/main.rs"
