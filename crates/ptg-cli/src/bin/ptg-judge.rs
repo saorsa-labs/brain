@@ -105,6 +105,15 @@ struct Args {
     /// Max LLM judge retries on parse failure (never score parse-fail as a loss).
     #[arg(long, default_value_t = 3u32)]
     judge_parse_retries: u32,
+    /// Cap the number of A3 pairs judged by the LLM (and reported per-column) so a
+    /// large-column run does not trigger hundreds of judge calls. Pairs beyond
+    /// the cap are deterministically sampled by `--sample-seed`. Programmatic
+    /// metrics are computed only on the sampled set. Default 60.
+    #[arg(long, default_value_t = 60u32)]
+    max_pairs: u32,
+    /// Seed for the deterministic A3 pair sampling above `--max-pairs`.
+    #[arg(long, default_value_t = 0u64)]
+    sample_seed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +262,7 @@ struct PairResult {
 }
 
 /// A3 equal-call attribution pair: no-lateral second-look final vs lateral final.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct A3PairResult {
     mesh_run_id: String,
     control_run_id: String,
@@ -415,6 +424,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut a3_pairs = analyze_a3_pairs(&runs);
+    let a3_total = a3_pairs.len();
+    sample_a3_pairs(&mut a3_pairs, args.max_pairs, args.sample_seed);
+    if a3_total > a3_pairs.len() {
+        eprintln!(
+            "sampled A3 pairs {}/{} (max-pairs={}, seed={})",
+            a3_pairs.len(),
+            a3_total,
+            args.max_pairs,
+            args.sample_seed
+        );
+    }
     if let Some((client, key)) = judge_client.as_ref() {
         for pair in a3_pairs.iter_mut().filter(|p| !p.excluded) {
             let Some((control_col, mesh_col, mesh_run)) = find_a3_columns(&runs, pair) else {
@@ -496,9 +516,28 @@ fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
         };
         let mesh_determinism_ok = check_determinism(mesh_ticks);
         let control_stable = second_look_stable(control_ticks);
+        // Topology-aware determinism: the named sink column (CC_PSYCH_01) only
+        // exists in the default 4-column graph. For generated topologies there is
+        // no named sink, so the no-lateral control being stable across ticks is
+        // the determinism proxy instead.
+        let has_named_determinism = mesh_final.contains_key(DETERMINISM_COLUMN);
+        let determinism_ok = if has_named_determinism {
+            mesh_determinism_ok
+        } else {
+            control_stable
+        };
 
-        for col_id in LATERAL_RECEIVERS {
-            let col_id: &str = col_id;
+        // Receivers are route-derived, not static: only columns that ACTUALLY
+        // received non-empty lateral context on the mesh final tick are
+        // meaningful A3 comparisons. Sorted for deterministic ordering.
+        let mut receivers: Vec<&str> = mesh_final
+            .iter()
+            .filter(|(_, c)| c.lateral_active)
+            .map(|(id, _)| *id)
+            .collect();
+        receivers.sort_unstable();
+
+        for col_id in receivers {
             let (Some(mesh_col), Some(control_col)) =
                 (mesh_final.get(col_id), control_final.get(col_id))
             else {
@@ -523,9 +562,13 @@ fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
             } else if control.truncated {
                 excluded = true;
                 reason = Some("control_truncated".into());
-            } else if !mesh_determinism_ok {
+            } else if !determinism_ok {
                 excluded = true;
-                reason = Some("mesh_determinism_failed".into());
+                reason = Some(if has_named_determinism {
+                    "mesh_determinism_failed".to_string()
+                } else {
+                    "control_second_look_unstable".to_string()
+                });
             } else if !two_tick_a3 {
                 excluded = true;
                 reason = Some("non_two_tick_a3".into());
@@ -546,7 +589,7 @@ fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
                 prompt_id: mesh.prompt_id.clone(),
                 repeat_index: mesh.repeat_index,
                 column_id: col_id.to_string(),
-                mesh_determinism_ok,
+                mesh_determinism_ok: determinism_ok,
                 control_second_look_stable: control_stable,
                 mesh_echoed_neighbor: echoed,
                 mesh_truncated: mesh.truncated,
@@ -584,6 +627,33 @@ fn find_a3_columns<'a>(
     let mesh_col = mesh_final.get(pair.column_id.as_str()).copied()?;
     let control_col = control_final.get(pair.column_id.as_str()).copied()?;
     Some((control_col, mesh_col, mesh))
+}
+
+/// Deterministically down-sample A3 pairs to at most `max_pairs` when a
+/// large-column run would otherwise yield hundreds of judge calls. Pairs are
+/// sorted (prompt, repeat, column) for stable order, then every k-th pair is
+/// kept (a representative stride spread across columns). `max_pairs == 0` keeps
+/// all pairs (used by tests / when an explicit cap is undesirable).
+fn sample_a3_pairs(pairs: &mut Vec<A3PairResult>, max_pairs: u32, _seed: u64) {
+    let cap = max_pairs as usize;
+    if cap == 0 || pairs.len() <= cap {
+        return;
+    }
+    pairs.sort_by(|a, b| {
+        a.prompt_id
+            .cmp(&b.prompt_id)
+            .then(a.repeat_index.cmp(&b.repeat_index))
+            .then(a.column_id.cmp(&b.column_id))
+    });
+    let step = pairs.len() / cap;
+    let step = step.max(1);
+    let mut sampled = Vec::with_capacity(cap);
+    let mut i = 0;
+    while sampled.len() < cap && i < pairs.len() {
+        sampled.push(pairs[i].clone());
+        i += step;
+    }
+    *pairs = sampled;
 }
 
 fn source_ids_for_tick(tick: &TickSnapshot, listener_id: &str) -> Vec<String> {
@@ -1309,7 +1379,14 @@ fn append_a3_report(s: &mut String, args: &Args, pairs: &[A3PairResult]) {
         return;
     }
 
-    s.push_str(&format!("- A3 pairs analyzed: {}\n", pairs.len()));
+    s.push_str(&format!("- A3 pairs analyzed: {}", pairs.len()));
+    if (args.max_pairs as usize) > 0 && pairs.len() as u32 == args.max_pairs {
+        s.push_str(&format!(
+            " (capped/sampled to --max-pairs {})",
+            args.max_pairs
+        ));
+    }
+    s.push('\n');
     let excluded = pairs.iter().filter(|p| p.excluded).count();
     s.push_str(&format!("- A3 excluded pairs: {}\n", excluded));
     let unstable = pairs
@@ -1349,11 +1426,20 @@ fn append_a3_report(s: &mut String, args: &Args, pairs: &[A3PairResult]) {
     } else {
         s.push_str("| column | n | prediction edit dist (med) | domain-field change % (med) | mean conf delta (self-report, NON-evidence) |\n");
         s.push_str("|---|---|---|---|---|\n");
-        for col in LATERAL_RECEIVERS {
+        // Distinct columns present in the (possibly sampled) scored set. Sorted
+        // for deterministic output; not hardcoded to the default 3 receivers.
+        let mut columns: Vec<&str> = scored
+            .iter()
+            .map(|p| p.column_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        columns.sort_unstable();
+        for col in columns {
             let cs: Vec<&A3PairResult> = scored
                 .iter()
                 .copied()
-                .filter(|p| p.column_id == *col)
+                .filter(|p| p.column_id == col)
                 .collect();
             if cs.is_empty() {
                 continue;
