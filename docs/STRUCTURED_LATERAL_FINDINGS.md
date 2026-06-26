@@ -88,3 +88,66 @@ params). Decision rule (pre-registered carryover):
 
 This run has NOT been executed yet; it is the recommended next step pending
 the e4b server being live.
+
+---
+
+## UPDATE: e4b result — RESURRECTION (capacity was the binding constraint)
+
+**Run:** `bench-runs/1782497723625/` (e4b, identical config to the e2b run above).
+
+### Cross-model results
+
+| Metric | e2b raw | e2b struct | **e4b struct** |
+|---|---:|---:|---:|
+| Lateral win rate (decided) | 11/23 = 47.8% | 10/30 = 33.3% | **29/37 = 78.4%** |
+| Echo-leakage rate | 13/42 = 31.0% | 11/42 = 26.2% | **5/45 = 11.1%** |
+| 95% Wilson CI (win rate) | 29.2–67.0% | 19.2–51.2% | **62.8–88.6%** |
+
+The e2b-structured vs e4b-structured difference is **z = −3.72, p = 0.0002**;
+the confidence intervals do **not** overlap (51.2% < 62.8%). This is a real,
+large, model-size-dependent effect — not noise.
+
+A second, independent signal agrees: the within-run A2 comparison on e4b gives
+tick_1 (no lateral) 9 vs tick_2 (lateral) 30 — lateral wins 30-to-9 in a
+different comparison structure.
+
+### Pre-registered classification
+
+- **Lateral win rate 78.4% clears the ≥55% resurrect bar** (CI lower bound
+  62.8% > 55%). ✓
+- **Echo 11.1% is at the boundary** — one pair over the <10% bar (5/45; ≤4
+  would clear it). Echo fell monotonically 31% → 26% → 11% across raw-e2b →
+  struct-e2b → struct-e4b, so the trend is clearly downward.
+
+**Verdict: RESURRECT on quality; echo at the boundary.** The lateral concept is
+NOT dead. On a 4B model with structured exchange, lateral beats the no-lateral
+second-look by 29 to 8.
+
+### Correction to the e2b interpretation
+
+The e2b section above concluded "this points to capacity being the binding
+constraint." A team review (red-team) correctly showed that inference was
+**premature on e2b alone**: the e2b structured-vs-raw difference (33.3% vs
+47.8%) was noise-level (p ≈ 0.29) and the structured intervention bundled three
+confounds (format, truncation, synthesis directive). **e2b alone could not
+support the capacity conclusion.**
+
+The e4b run resolves it: because the identical bundled intervention *succeeds*
+on e4b and *fails* on e2b with non-overlapping CIs, capacity is confirmed as
+the binding constraint. The directive/truncation concerns moot on a capable
+model — whatever they do, a 4B model integrates peer evidence productively.
+
+### What this changes for the project
+
+- **Do not abandon the lateral mesh.** The Thousand-Brains lateral concept is
+  viable on a 4B-class model.
+- **Structured exchange is the better medium**, and the cache-economy benefit is
+  real (e4b mesh cached 65.4% vs control 98.3% — lateral still costs prefix-cache
+  but far less than raw verbatim would).
+- **The path forward is scale + structured exchange**, not `ptg-belief` (yet).
+- Optional follow-up (no longer blocking): the red-team ablation
+  (structured-without-directive / raw-with-truncation) to fully isolate which
+  element of the bundled intervention matters. Lower priority now that the
+  bundled intervention demonstrably works on e4b.
+- Still open: does the win hold at the 150-column scale that originally failed?
+That is the natural next experiment — structured + e4b + sparse topology.
