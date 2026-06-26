@@ -151,3 +151,38 @@ model — whatever they do, a 4B model integrates peer evidence productively.
   bundled intervention demonstrably works on e4b.
 - Still open: does the win hold at the 150-column scale that originally failed?
 That is the natural next experiment — structured + e4b + sparse topology.
+
+---
+
+## Length-control check (responds to team review's #1 confound)
+
+Both reviewers flagged **judge length/richness bias** as the strongest
+unaddressed threat to the e4b 4-col result: a 70B judge might prefer the mesh
+arm simply because its outputs are longer/more detailed. This was never
+controlled. Analysis on the existing e4b data (`bench-runs/1782497723625/`):
+
+Final-tick prediction char-lengths, paired by (prompt, repeat, column), n=60:
+
+| | mean | median | min | max |
+|---|---:|---:|---:|---:|
+| mesh_adaptive | 390 | 396 | 219 | 696 |
+| sphere_x4_second_look | 394 | 375 | 216 | 784 |
+| paired diff (mesh − second) | **−3.2** | **0.0** | — | — |
+
+- Relative length difference: **−0.8%** (mesh is fractionally *shorter*, not longer).
+- 25% of pairs are byte-equal length; mesh is longer in only 46.7% of pairs.
+
+**Conclusion: the length confound does not hold for the within-e4b A3 result.**
+The drafts the judge compared are essentially the same length. A length-preferring
+judge would have no systematic reason to favor mesh here; mesh won 29/37 = 78%
+*despite* being marginally shorter. The 4-col e4b resurrection is **not** a
+length artifact.
+
+Scope note (honest): a length-control analysis was first run on the wrong
+population (all columns incl. the non-receiver sink) and wrong text (prediction
+field only); corrected on the exact 37 judged pairs with winner-mapping
+validated against the report. Result: see `docs/LENGTH_CONTROL_ANALYSIS.md`.
+The corrected finding — mesh drafts are modestly longer (+7%), BUT lateral wins
+64% even when its draft is shorter — means length partially inflates the 78%
+headline yet does not explain the effect away. The 4-col resurrection survives
+length control as a real-but-inflated effect.
