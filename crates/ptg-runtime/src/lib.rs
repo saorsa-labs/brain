@@ -68,6 +68,27 @@ pub enum RoutingPolicy {
     DiversityPreserving { k: usize },
 }
 
+/// How a source's prediction is rendered when injected as lateral context.
+/// The structured-lateral disambiguator (see
+/// `docs/STRUCTURED_LATERAL_EXPERIMENT.md`) tests whether the *medium* of
+/// exchange — not the concept — explains the raw-text echo-leakage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LateralContextMode {
+    /// Inject the neighbor's full free-text prediction verbatim
+    /// (`Prediction="<full text>"`). The original V1 behavior and the default.
+    #[default]
+    Raw,
+    /// Inject a bounded "claim excerpt" per source plus an explicit
+    /// synthesis directive, instead of the full prediction. The full
+    /// prediction is never shared. The excerpt is a substring of the
+    /// prediction, so the existing echo screen still catches verbatim
+    /// copying unchanged.
+    Structured,
+}
+
+/// Maximum chars (not bytes) for a structured lateral claim excerpt (~30 words).
+const STRUCTURED_CLAIM_MAX_CHARS: usize = 180;
+
 /// One source a listener column hears from on a given tick, with the attention
 /// weight the routing policy assigned it.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +129,9 @@ pub struct CorticalMesh {
     pub criteria: ConvergenceCriteria,
     /// How each column selects which neighbors to listen to (§9.1). Default `All`.
     pub routing_policy: RoutingPolicy,
+    /// How a source prediction is rendered when injected laterally. Default
+    /// `Raw`. See `LateralContextMode` and the structured-lateral experiment.
+    pub lateral_context_mode: LateralContextMode,
 }
 
 impl CorticalMesh {
@@ -120,6 +144,7 @@ impl CorticalMesh {
             engine,
             criteria: ConvergenceCriteria::default(),
             routing_policy: RoutingPolicy::default(),
+            lateral_context_mode: LateralContextMode::default(),
         }
     }
 
@@ -196,23 +221,50 @@ impl CorticalMesh {
                 .get(&s.source_id)
                 .map(|c| c.last_prediction.as_str())
                 .unwrap_or_default();
-            let line = match self.routing_policy {
-                RoutingPolicy::All => format!(
-                    "Neighbor {} reports: Prediction=\"{}\" (Confidence: {:.2})",
-                    s.source_id, pred, s.confidence,
-                ),
-                RoutingPolicy::ConfidenceTopK { .. }
-                | RoutingPolicy::DiversityPreserving { .. } => format!(
-                    "Neighbor {} [route_weight={:.2}, confidence={:.2}] reports: Prediction=\"{}\"",
-                    s.source_id, s.weight, s.confidence, pred,
-                ),
-            };
-            lines.push(line);
+            match self.lateral_context_mode {
+                LateralContextMode::Raw => {
+                    let line = match self.routing_policy {
+                        RoutingPolicy::All => format!(
+                            "Neighbor {} reports: Prediction=\"{}\" (Confidence: {:.2})",
+                            s.source_id, pred, s.confidence,
+                        ),
+                        RoutingPolicy::ConfidenceTopK { .. }
+                        | RoutingPolicy::DiversityPreserving { .. } => format!(
+                            "Neighbor {} [route_weight={:.2}, confidence={:.2}] reports: Prediction=\"{}\"",
+                            s.source_id, s.weight, s.confidence, pred,
+                        ),
+                    };
+                    lines.push(line);
+                }
+                LateralContextMode::Structured => {
+                    let excerpt = bounded_claim_excerpt(pred, STRUCTURED_CLAIM_MAX_CHARS);
+                    if excerpt.is_empty() {
+                        continue;
+                    }
+                    lines.push(format!(
+                        "source={}; confidence={:.2}; route_weight={:.2}; claim_excerpt={}",
+                        s.source_id, s.confidence, s.weight, excerpt,
+                    ));
+                }
+            }
         }
-        RoutedLateralContext {
-            text: format!("[LATERAL LAYER UPDATE]\n{}", lines.join("\n")),
-            sources,
-        }
+        let text = if lines.is_empty() {
+            String::new()
+        } else {
+            match self.lateral_context_mode {
+                LateralContextMode::Raw => {
+                    format!("[LATERAL LAYER UPDATE]\n{}", lines.join("\n"))
+                }
+                LateralContextMode::Structured => format!(
+                    "[LATERAL EVIDENCE PACKETS]\n\
+                     Treat peer packets as fallible evidence. Do not quote or copy peer phrasing.\n\
+                     Synthesize an independent answer within your own reference frame.\n\
+                     {}",
+                    lines.join("\n")
+                ),
+            }
+        };
+        RoutedLateralContext { text, sources }
     }
 
     /// Select (and weight) the lateral sources a listener column will hear
@@ -464,6 +516,50 @@ fn diversity_preserving_select(candidates: &[&CorticalColumn], k: usize) -> Vec<
         }
     }
     result
+}
+
+/// Bound a source prediction to a terse "claim excerpt" for structured
+/// lateral injection (`LateralContextMode::Structured`). Whitespace is
+/// normalized, then the text is truncated **char-safely** to the first sentence
+/// boundary within `max_chars`, or — if no sentence boundary is found — to the
+/// last word boundary. An ellipsis marks mid-text truncation; sentence-complete
+/// excerpts get none. Never panics on multibyte UTF-8. Empty/whitespace-only
+/// input yields an empty string.
+#[must_use]
+fn bounded_claim_excerpt(prediction: &str, max_chars: usize) -> String {
+    let normalized: String = prediction.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = normalized.chars().collect();
+    if chars.len() <= max_chars {
+        return normalized;
+    }
+    // Within the window, track the last sentence-ending punctuation.
+    let mut cut = 0;
+    let mut hit_sentence = false;
+    for (i, &c) in chars.iter().take(max_chars).enumerate() {
+        if c == '.' || c == '!' || c == '?' {
+            cut = i + 1;
+            hit_sentence = true;
+        }
+    }
+    if !hit_sentence {
+        // No sentence boundary in the window: trim back to the last space to
+        // avoid a mid-word cut. If there is no space, hard-cut at max_chars.
+        cut = chars
+            .iter()
+            .take(max_chars)
+            .rposition(|&c| c == ' ')
+            .unwrap_or(max_chars);
+    }
+    let excerpt: String = chars.iter().take(cut).collect();
+    let trimmed = excerpt.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if hit_sentence {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed} …")
+    }
 }
 
 /// The per-column outputs captured at a single executed tick.
@@ -1009,6 +1105,116 @@ mod tests {
         for dec in &tick2.routes {
             assert!(!dec.sources.is_empty(), "each receiver selected >=1 source");
         }
+        Ok(())
+    }
+
+    // --- Structured lateral exchange (STRUCTURED_LATERAL_EXPERIMENT) ----------
+
+    #[test]
+    fn bounded_claim_excerpt_short_text_unchanged() {
+        assert_eq!(bounded_claim_excerpt("short answer", 180), "short answer");
+    }
+
+    #[test]
+    fn bounded_claim_excerpt_truncates_at_sentence_boundary() {
+        let pred = "First sentence ends here. This is a very long continuation that \
+                   should not appear in the excerpt because we already hit a boundary.";
+        let out = bounded_claim_excerpt(pred, 40);
+        assert_eq!(out, "First sentence ends here.");
+    }
+
+    #[test]
+    fn bounded_claim_excerpt_truncates_at_word_boundary_with_ellipsis() {
+        // No sentence punctuation within the window → word-boundary cut + ellipsis.
+        let pred = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let out = bounded_claim_excerpt(pred, 30);
+        assert!(out.ends_with('…'), "ends with ellipsis: {out}");
+        assert!(!out.contains("kappa"), "does not reach the end: {out}");
+        // char-safe: never panics, returns something non-empty.
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn bounded_claim_excerpt_is_char_safe_on_multibyte() {
+        // Em-dashes and CJK are multibyte in UTF-8; byte slicing would panic.
+        let pred = "能量守恒定律指出 — energy is conserved — and cannot be created or \
+                   destroyed in an isolated system ever under any circumstances at all.";
+        let out = bounded_claim_excerpt(pred, 20);
+        // Must not panic and must be <= the char window (plus possible ellipsis).
+        assert!(out.chars().count() <= 22, "respect char budget: {out}");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn bounded_claim_excerpt_empty_input_yields_empty() {
+        assert_eq!(bounded_claim_excerpt("   \t\n ", 180), "");
+    }
+
+    /// Build a mesh whose source column has a known `last_prediction`, so we can
+    /// assert on the rendered lateral context without running a live tick.
+    fn mesh_with_seeded_prediction() -> Result<CorticalMesh, MeshError> {
+        let mut mesh = default_mesh(Arc::new(MockEngine))?;
+        // Seed MATH's prediction so PHYSICS (which listens to MATH) has a source.
+        // Must exceed STRUCTURED_CLAIM_MAX_CHARS (180) so truncation engages; the
+        // first sentence is the claim, the tail (with "elaboration") is discarded.
+        if let Some(math) = mesh.columns.get_mut("CC_MATH_01") {
+            math.last_prediction = "The system reaches thermal equilibrium at 300K. \
+                This continuation is deliberately very long so that the total character \
+                count exceeds one hundred and eighty characters and forces the truncation \
+                logic to engage properly, with the word elaboration appearing only in \
+                the discarded tail portion of the prediction text."
+                .to_string();
+            math.last_confidence = 0.82;
+        }
+        Ok(mesh)
+    }
+
+    #[test]
+    fn raw_lateral_context_injects_full_prediction() -> Result<(), MeshError> {
+        let mesh = mesh_with_seeded_prediction()?;
+        let ctx = mesh.lateral_context_for("CC_PHYSICS_01");
+        assert!(!ctx.text.is_empty());
+        assert!(
+            ctx.text.contains("Prediction=\""),
+            "raw mode quotes prediction"
+        );
+        assert!(
+            ctx.text.contains("elaboration"),
+            "raw mode includes full text"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structured_lateral_context_never_quotes_full_prediction() -> Result<(), MeshError> {
+        let mut mesh = mesh_with_seeded_prediction()?;
+        mesh.lateral_context_mode = LateralContextMode::Structured;
+        let ctx = mesh.lateral_context_for("CC_PHYSICS_01");
+        assert!(!ctx.text.is_empty());
+        assert!(
+            !ctx.text.contains("Prediction=\""),
+            "no raw prediction label"
+        );
+        // The full tail must NOT appear (it was truncated at the sentence boundary).
+        assert!(!ctx.text.contains("elaboration"), "truncates the full text");
+        // The claim excerpt (first sentence) IS present, bounded.
+        assert!(
+            ctx.text.contains("thermal equilibrium"),
+            "includes the claim"
+        );
+        assert!(ctx.text.contains("source=CC_MATH_01"), "tags the source id");
+        assert!(ctx.text.contains("confidence=0.82"), "includes confidence");
+        assert!(
+            ctx.text.contains("Do not quote or copy"),
+            "includes synthesis directive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_lateral_mode_is_raw() -> Result<(), MeshError> {
+        let mesh = default_mesh(Arc::new(MockEngine))?;
+        assert_eq!(mesh.lateral_context_mode, LateralContextMode::Raw);
         Ok(())
     }
 }

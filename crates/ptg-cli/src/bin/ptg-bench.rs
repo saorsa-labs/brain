@@ -108,6 +108,29 @@ enum RoutingKind {
     Diversity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum LateralKind {
+    Raw,
+    Structured,
+}
+
+impl LateralKind {
+    const fn to_mode(self) -> ptg_runtime::LateralContextMode {
+        match self {
+            Self::Raw => ptg_runtime::LateralContextMode::Raw,
+            Self::Structured => ptg_runtime::LateralContextMode::Structured,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Structured => "structured",
+        }
+    }
+}
+
 impl RoutingKind {
     fn to_policy(self, k: usize) -> RoutingPolicy {
         match self {
@@ -212,6 +235,12 @@ struct Args {
     /// Source budget for `confidence-top-k` / `diversity` (default 2).
     #[arg(long, default_value_t = 2)]
     routing_k: usize,
+    /// How a source prediction is rendered when injected laterally (`mesh_adaptive`
+    /// only). `raw` (default, V1) injects the full prediction verbatim;
+    /// `structured` injects a bounded claim excerpt + synthesis directive
+    /// instead. See `docs/STRUCTURED_LATERAL_EXPERIMENT.md`.
+    #[arg(long = "lateral-mode", value_enum, default_value_t = LateralKind::Raw)]
+    lateral_mode: LateralKind,
 }
 
 /// One answer-producing run.
@@ -263,6 +292,10 @@ struct AnswerRunRecord {
     /// controls where lateral exchange never runs). Recorded so routing-policy
     /// comparisons are reproducible (§9.1).
     routing_policy: String,
+    /// Lateral rendering mode (`"raw"` or `"structured"`). Recorded so the
+    /// structured-lateral experiment is reproducible. "raw" for non-mesh
+    /// conditions where lateral exchange never runs.
+    lateral_mode: String,
     /// Topology label (`"default"`, `"ring"`, `"small-world"`, ...).
     topology: String,
     /// Number of columns in the mesh (`None` for monolithic conditions).
@@ -373,6 +406,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 format!(" k={}", args.routing_k)
             }
+        );
+        eprintln!(
+            "  lateral-mode: {} (mesh_adaptive only)",
+            args.lateral_mode.label()
         );
         let mono_disp = args.max_tokens_mono.map_or_else(
             || {
@@ -563,6 +600,7 @@ async fn run_one(
         rejected_count: None,
         integration_threshold: None,
         routing_policy: cond_routing_label(cond, args),
+        lateral_mode: args.lateral_mode.label().to_string(),
         topology: String::new(),
         column_count: None,
         edge_count: None,
@@ -686,6 +724,7 @@ async fn run_mesh(
     mesh.criteria.max_ticks = args.max_ticks;
     mesh.criteria.min_ticks = args.min_ticks;
     mesh.routing_policy = args.routing_policy.to_policy(args.routing_k);
+    mesh.lateral_context_mode = args.lateral_mode.to_mode();
     let threshold = mesh.criteria.min_integration_confidence;
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
     let final_active = active_listeners_for_tick(result.tick_outputs.last());
@@ -1009,6 +1048,10 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
         args.max_tokens_col,
         args.max_tokens_mono.unwrap_or_else(|| args.max_tokens_col.saturating_mul(args.mono_budget_multiplier)),
         if args.max_tokens_mono.is_some() { "explicit" } else { "col×mult" },
+    ));
+    s.push_str(&format!(
+        "- Lateral mode: `{}` (mesh_adaptive only)\n",
+        args.lateral_mode.label()
     ));
     s.push_str(&format!(
         "- Conditions: {}  Repeats/prompt: {}\n",
