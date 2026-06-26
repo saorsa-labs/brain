@@ -783,7 +783,11 @@ async fn run_mesh_second_look_no_lateral(
 fn disable_lateral_context(mesh: &mut ptg_runtime::CorticalMesh) {
     // k=0 is the runtime-supported "select no sources" policy. We keep the
     // topology intact but force every listener to receive empty lateral context.
+    // The mode is reset to Raw so the JSONL record honestly reflects that no
+    // structured injection occurred (k=0 makes the mode inert regardless, but
+    // this keeps post-hoc analysis from misreading a `structured` label).
     mesh.routing_policy = RoutingPolicy::ConfidenceTopK { k: 0 };
+    mesh.lateral_context_mode = ptg_runtime::LateralContextMode::Raw;
 }
 
 /// `sphere_x4_no_lateral` — the 1-tick no-voting control. Runs the mesh with
