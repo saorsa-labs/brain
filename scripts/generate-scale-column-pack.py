@@ -66,13 +66,19 @@ def prompt_for(i: int) -> tuple[str, str, int]:
     stance = STANCES[stance_idx]
     required = SPHERE_KEYS[sphere]
     cid = f"CC_{SHORT[sphere]}_{i:03d}"
+    # A concrete example object with the sphere's REQUIRED keys filled in. The
+    # concise prose alone did not elicit reliable schema compliance at small
+    # model sizes (columns omitted required domain_fields); the example anchors
+    # the exact shape the validator expects.
+    example_fields = ", ".join(f'"{k}": "..."' for k in required)
     body = (
         f"You are cortical column {cid}: a {sphere} specialist. "
         f"{SPHERE_GUIDANCE[sphere]}\n\n"
-        f"Emit ONE flat JSON object (no prose, no code fence) with keys: "
-        f'"reference_frame_coordinates" (string), "prediction" (string), '
-        f'"confidence" (0.0-1.0 float), and "domain_fields" (object) whose '
-        f'domain_fields MUST contain: {", ".join(required)}.\n\n'
+        f"Emit ONE flat JSON object (no prose, no code fence) with EXACTLY this shape:\n"
+        f'{{"reference_frame_coordinates": "...", "prediction": "...", '
+        f'"confidence": 0.0, "domain_fields": {{{example_fields}}}}}\n'
+        f'The domain_fields MUST contain: {", ".join(required)}. Fill every field '
+        f"with substantive content grounded in the task.\n\n"
         f"Operating lens for THIS column (let it shape your analysis):\n"
         f"- abstraction level {level}: {level_desc}\n"
         f"- time horizon: {horizon}\n"
@@ -99,6 +105,14 @@ def main(argv: list[str]) -> int:
     print('# Auto-generated PTG scale column pack.')
     print(f'# {n} columns, differentiated by abstraction level / time horizon /')
     print('# diagnostic stance. Regenerate via scripts/generate-scale-column-pack.py.')
+    print('#')
+    print('# CAVEAT: these CONCISE generated prompts are differentiated but do not yet')
+    print('# elicit reliable per-sphere JSON schema compliance at small model sizes')
+    print('# (e.g. gemma-4-e2b): some Coding columns omit `state_variables`, failing')
+    print('# validate_for_sphere and aborting the fail-fast mesh. The hand-tuned default')
+    print('# sphere prompts DO comply. For a reliable differentiated pack, base each')
+    print('# prompt on the default sphere prompt and append only the lens suffix, or')
+    print('# raise the model size. See docs/SCALE_BENCHMARKING.md.')
     print('description = "scale diagnostic pack: differentiated sphere+lens columns"')
     print()
     for i in range(n):

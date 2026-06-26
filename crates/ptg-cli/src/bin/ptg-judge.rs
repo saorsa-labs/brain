@@ -515,17 +515,11 @@ fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
             continue;
         };
         let mesh_determinism_ok = check_determinism(mesh_ticks);
-        let control_stable = second_look_stable(control_ticks);
-        // Topology-aware determinism: the named sink column (CC_PSYCH_01) only
-        // exists in the default 4-column graph. For generated topologies there is
-        // no named sink, so the no-lateral control being stable across ticks is
-        // the determinism proxy instead.
-        let has_named_determinism = mesh_final.contains_key(DETERMINISM_COLUMN);
-        let determinism_ok = if has_named_determinism {
-            mesh_determinism_ok
-        } else {
-            control_stable
-        };
+        // NOTE: `second_look_stable` (whole-run) is intentionally NOT used as an
+        // A3 gate at scale: requiring all N control columns to be byte-identical
+        // across ticks lets a single nondeterministic call exclude the entire
+        // run. The A3 determinism gate is PER-COLUMN (see `col_control_stable`
+        // in the loop below); `mesh_determinism_ok` is reported for context.
 
         // Receivers are route-derived, not static: only columns that ACTUALLY
         // received non-empty lateral context on the mesh final tick are
@@ -551,6 +545,7 @@ fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
                 .collect();
             let echoed =
                 mesh_col.lateral_active && echo_screen_against_sources(mesh_col, &source_preds);
+            let col_control_stable = column_stable_across_ticks(control_ticks, col_id);
             let mut excluded = false;
             let mut reason = None;
             if !mesh.parse_ok || !control.parse_ok {
@@ -562,17 +557,10 @@ fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
             } else if control.truncated {
                 excluded = true;
                 reason = Some("control_truncated".into());
-            } else if !determinism_ok {
-                excluded = true;
-                reason = Some(if has_named_determinism {
-                    "mesh_determinism_failed".to_string()
-                } else {
-                    "control_second_look_unstable".to_string()
-                });
             } else if !two_tick_a3 {
                 excluded = true;
                 reason = Some("non_two_tick_a3".into());
-            } else if !control_stable {
+            } else if !col_control_stable {
                 excluded = true;
                 reason = Some("control_second_look_unstable".into());
             } else if !mesh_col.lateral_active {
@@ -589,8 +577,8 @@ fn analyze_a3_pairs(runs: &[AnswerRun]) -> Vec<A3PairResult> {
                 prompt_id: mesh.prompt_id.clone(),
                 repeat_index: mesh.repeat_index,
                 column_id: col_id.to_string(),
-                mesh_determinism_ok: determinism_ok,
-                control_second_look_stable: control_stable,
+                mesh_determinism_ok,
+                control_second_look_stable: col_control_stable,
                 mesh_echoed_neighbor: echoed,
                 mesh_truncated: mesh.truncated,
                 control_truncated: control.truncated,
@@ -632,9 +620,10 @@ fn find_a3_columns<'a>(
 /// Deterministically down-sample A3 pairs to at most `max_pairs` when a
 /// large-column run would otherwise yield hundreds of judge calls. Pairs are
 /// sorted (prompt, repeat, column) for stable order, then every k-th pair is
-/// kept (a representative stride spread across columns). `max_pairs == 0` keeps
-/// all pairs (used by tests / when an explicit cap is undesirable).
-fn sample_a3_pairs(pairs: &mut Vec<A3PairResult>, max_pairs: u32, _seed: u64) {
+/// kept (a representative stride spread across columns). `sample_seed` shifts
+/// the stride's start offset so nonzero seeds select a different (still
+/// deterministic) subset. `max_pairs == 0` keeps all pairs.
+fn sample_a3_pairs(pairs: &mut Vec<A3PairResult>, max_pairs: u32, sample_seed: u64) {
     let cap = max_pairs as usize;
     if cap == 0 || pairs.len() <= cap {
         return;
@@ -647,8 +636,13 @@ fn sample_a3_pairs(pairs: &mut Vec<A3PairResult>, max_pairs: u32, _seed: u64) {
     });
     let step = pairs.len() / cap;
     let step = step.max(1);
+    let start = if step > 1 {
+        (sample_seed as usize) % step
+    } else {
+        0
+    };
     let mut sampled = Vec::with_capacity(cap);
-    let mut i = 0;
+    let mut i = start;
     while sampled.len() < cap && i < pairs.len() {
         sampled.push(pairs[i].clone());
         i += step;
@@ -694,23 +688,25 @@ fn final_tick_snapshot(run: &AnswerRun) -> Option<&TickSnapshot> {
     run.tick_outputs.as_ref()?.iter().max_by_key(|t| t.tick)
 }
 
-fn second_look_stable(ticks: &[TickSnapshot]) -> bool {
-    let Some(first) = ticks.iter().min_by_key(|t| t.tick) else {
-        return false;
-    };
-    let Some(final_tick) = ticks.iter().max_by_key(|t| t.tick) else {
-        return false;
-    };
-    if first.tick == final_tick.tick {
-        return false;
+fn column_stable_across_ticks(ticks: &[TickSnapshot], col_id: &str) -> bool {
+    let first = ticks.iter().min_by_key(|t| t.tick);
+    let last = ticks.iter().max_by_key(|t| t.tick);
+    match (first, last) {
+        (Some(f), Some(l)) if f.tick != l.tick => {
+            match (
+                find_column(&f.outputs, col_id),
+                find_column(&l.outputs, col_id),
+            ) {
+                (Some(a), Some(b)) => canonical(&a.schema) == canonical(&b.schema),
+                _ => false,
+            }
+        }
+        _ => false,
     }
-    let final_map = column_map(&final_tick.outputs);
-    first.outputs.iter().all(|c1| {
-        final_map
-            .get(c1.column_id.as_str())
-            .map(|c2| canonical(&c1.schema) == canonical(&c2.schema))
-            .unwrap_or(false)
-    })
+}
+
+fn find_column<'a>(cols: &'a [CanonicalColumn], id: &str) -> Option<&'a CanonicalColumn> {
+    cols.iter().find(|c| c.column_id == id)
 }
 
 // ---------------------------------------------------------------------------

@@ -126,3 +126,59 @@ benchmarking and a generalized judge.
    does not discard hundreds of successful calls.
 4. Consider a terse/scale-specific column pack if repeated default prompts are
    too homogeneous for meaningful 150-column experiments.
+
+## Scale A3 benchmark (default replicated prompts, 150 columns)
+
+After the retry hardening, a full `ptg-bench` A3 run completed at 150 columns:
+small-world (degree 4, 600 edges), diversity routing k=2, 2 ticks, 1 prompt,
+1 repeat, **default replicated sphere prompts** (not the differentiated pack —
+see the schema-compliance caveat below). Run: `bench-runs/1782488218572/`.
+
+Per-condition (both 300 calls = 150 columns × 2 ticks, equal budget):
+
+| condition | cache-adj total tok (med) | cached% (med) |
+|---|---:|---:|
+| mesh_adaptive | 174101 | 42.5 |
+| sphere_x4_second_look_no_lateral | 123540 | 83.8 |
+
+Lateral exchange again roughly halves the prefix-cache hit rate (42.5% vs
+83.8%) — the same cache-collapse pattern seen in the 4-column pilot (43.5% vs
+98%+).
+
+### A3 judge (generalized, route-derived receivers, 60-pair sample)
+
+The generalized judge derived ~150 lateral receivers from the routes and sampled
+60 (stride, `--max-pairs 60`). With the per-column determinism gate:
+
+- A3 pairs analyzed: 60 (sampled from 150)
+- excluded: 39
+  - `mesh_echoed_neighbor`: 34 (**57% echo-leakage rate** — severe at scale)
+  - `control_second_look_unstable`: 5
+- judged winners: **lateral 3, second_look 18**
+
+### Interpretation
+
+At 150 columns the result is stronger and more negative than the 4-column
+pilot (which was a coin flip, 11 vs 12):
+
+- lateral exchange is **strongly disfavored** by the blind judge (3 vs 18);
+- neighbor-text echo leakage is **severe** (57%), because dense lateral text
+  routinely leaks verbatim into outputs and gets excluded;
+- the cache-collapse penalty persists.
+
+This is directional (1 prompt, 1 repeat, default replicated prompts, same-model
+judge), not a powered quality claim. But it reinforces the core conclusion:
+**do not scale the current dense lateral-text exchange.** Scaling makes the
+mechanism worse on every measured axis (quality, leakage, cache economy).
+
+### Differentiated pack: schema-compliance blocker
+
+`examples/column-packs/scale-diagnostic-150.toml` differentiates columns by lens
+axes, but its concise prompts do not yet elicit reliable per-sphere JSON
+compliance at `gemma-4-e2b`: some Coding columns omit `state_variables`, failing
+`validate_for_sphere` and aborting the fail-fast mesh (even at a 1024-token cap;
+the same column's prompt produces valid JSON in an isolated direct call, so the
+failure is a compliance-fragility of the concise prompt under the mesh path).
+The hand-tuned default sphere prompts comply reliably. A robust differentiated
+pack should base each prompt on the default sphere prompt and append only the
+lens suffix, or move to a larger model.
