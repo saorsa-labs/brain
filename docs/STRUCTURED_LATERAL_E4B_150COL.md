@@ -1,8 +1,16 @@
-# 150-column structured-e4b — the scale frontier, unblocked
+# 150-column structured-e4b — the scale frontier, unblocked (1p1r)
 
-> **Status: POSITIVE, powered.** The scale at which raw lateral exchange
-> catastrophically failed now produces the strongest result in the project.
-> Run: `bench-runs/1782571485502/` (150 cols, structured, e4b, `--column-concurrency 4`).
+> **⚠️ SUPERSEDED by the powered run — see
+> [`STRUCTURED_LATERAL_E4B_150COL_POWERED.md`](./STRUCTURED_LATERAL_E4B_150COL_POWERED.md).**
+> The 93% figure below was **small-sample optimism** (43 decided pairs). The
+> powered run (392 decided pairs) shows the true rate is **82.4%**, CI
+> [78.3%, 85.8%]. The "strengthens with scale" narrative in §"Cross-scale
+> consistency" below is **incorrect** — the corrected trend is roughly flat
+> ~80–85%, not increasing. This 1p1r doc is retained as the pre-powered record;
+> cite the powered doc for any claim.
+>
+> Original (1p1r) status: POSITIVE, directional. Run: `bench-runs/1782571485502/`
+> (150 cols, structured, e4b, `--column-concurrency 4`, 1 prompt × 1 repeat).
 
 ## Why this run was possible now
 

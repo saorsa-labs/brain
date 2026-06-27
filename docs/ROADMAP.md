@@ -89,6 +89,23 @@ quality? Methodology is in [`docs/BENCHMARKING.md`](./BENCHMARKING.md).
 - [x] **Structured on e4b at 50 cols: GENERALIZES.** lateral 84.4%, echo 6%
       (clean), survives length control. [`STRUCTURED_LATERAL_E4B_50COL.md`](./STRUCTURED_LATERAL_E4B_50COL.md).
       → The 4-col effect is not an artifact; it holds at 12.5× fan-out.
+- [x] **Structured on e4b at 50 cols: POWERED.** 5p×3r, lateral 85.1% (40/47),
+      Wilson CI [72.3%, 92.6%], p = 1.5×10⁻⁶ vs null. Both pre-registered bars
+      clear; length-control validated (69% win when shorter); cross-run stable.
+      [`STRUCTURED_LATERAL_E4B_50COL_POWERED.md`](./STRUCTURED_LATERAL_E4B_50COL_POWERED.md).
+- [x] **e4b 150-col ceiling FIXED.** Root cause was *unbounded client fan-out*
+      (runtime `join_all` fired 150 concurrent requests at a 4-slot server →
+      transport errors + task-cancellation bursts), not OOM/context/slots. Fix:
+      `CorticalMesh.max_concurrent_column_ticks` + `ptg-bench --column-concurrency`.
+      Validated: fresh 4-slot e4b ran 300/300, 0 errors.
+      [`E4B_SERVER_TUNING.md`](./E4B_SERVER_TUNING.md).
+- [x] **Structured on e4b at 150 cols: POWERED, positive.** 5p×3r, lateral
+      **82.4%** (323/392), Wilson CI [78.3%, 85.8%], p ≈ 0 (z=12.83); echo 8.4%;
+      length-control validated (75% win when shorter, only +2.4% length diff).
+      Both pre-registered bars clear decisively.
+      [`STRUCTURED_LATERAL_E4B_150COL_POWERED.md`](./STRUCTURED_LATERAL_E4B_150COL_POWERED.md).
+      → **Corrects the 1p1r 93% to the true ~82%.** The effect *saturates* at
+        ~80–85% across 4→150 cols; it does **not** keep strengthening with scale.
 
 ### Current direction (revised)
 
@@ -99,18 +116,21 @@ structured exchange + larger models + moderate scale — **not** `ptg-belief` (y
 
 ### Open / next
 
-- [ ] **Powered 50-col run** (5 prompts × 3 repeats, structured, e4b): confirm
-      the 50-col result is stable, not a single-prompt draw. Decision rule:
-      lateral win-rate CI lower bound > 55% AND echo < 10%.
-- [ ] **150-col on e4b: infra-blocked** (server dies ~85% through the mesh arm,
-      3 attempts, 2 topologies). [`STRUCTURED_LATERAL_E4B_SCALE_BLOCKED.md`](./STRUCTURED_LATERAL_E4B_SCALE_BLOCKED.md).
-      Needs server-capacity fixes (KV-cache budget, slot tuning) before re-attempt.
+- [x] ~~Powered 50-col run~~ — done (85.1%, p≈10⁻⁶). See evidence arc above.
+- [x] ~~150-col on e4b: infra-blocked~~ — **unblocked** by the
+      `--column-concurrency` fix; powered result is 82.4% (p ≈ 0).
+      [`STRUCTURED_LATERAL_E4B_150COL_POWERED.md`](./STRUCTURED_LATERAL_E4B_150COL_POWERED.md).
+- [ ] **Survivorship follow-up:** 3/15 mesh runs failed (HTTP 500 in MATH cols,
+      retry-exhausted) and were excluded from the powered judge. A run with 0
+      mesh failures would confirm the ~82% rate isn't inflated by exclusion.
+      The MATH-column 500 clustering is an infra finding (likely long-generation
+      server limit), not a quality result.
 - [ ] **A4 explicit self-revision control** ("reconsider your answer"): the A3
       no-lateral second-look at temp 0 is an inert replay, not genuine revision.
       Needed to separate lateral exchange from self-revision.
 - [ ] Optional: red-team ablation (structured-without-directive /
       raw-with-truncation) to isolate which element of the bundled intervention
-      matters. Lower priority now that the bundle works on e4b.
+      matters. Lower priority now that the bundle works on e4b at scale.
 
 ## Phase 3 — Topologies, routing, convergence, & structured exchange ✅
 
@@ -133,11 +153,13 @@ structured exchange + larger models + moderate scale — **not** `ptg-belief` (y
 
 ## Phase 4 — Scale, infrastructure, & the next frontier
 
-- [ ] **Powered 50-col structured-e4b confirmation** (running): 5 prompts × 3
-      repeats. The first statistically interpretable scale result.
-- [ ] **e4b server capacity fixes** to unlock 150 cols: the 4B-model server dies
-      ~85% through sustained mesh runs (3 reproductions, 2 topologies). KV-cache
-      budget / slot / keepalive tuning before re-attempting 150-col.
+- [x] **Powered 50-col structured-e4b confirmation** — done: 85.1%, p≈10⁻⁶.
+- [x] **Powered 150-col structured-e4b** — done: 82.4%, CI [78%, 86%], p ≈ 0.
+      First statistically decisive result at the scale where raw exchange failed.
+- [x] **e4b 150-col infra ceiling FIXED** — root cause was unbounded client
+      fan-out (`join_all` over all columns), not server capacity. Fix:
+      `max_concurrent_column_ticks` + `--column-concurrency`. See
+      [`E4B_SERVER_TUNING.md`](./E4B_SERVER_TUNING.md).
 - [ ] Workstation tuning on unified-memory hardware (§7): ring-buffer memory
       budget audit, HTTP/2 multiplexing under load.
 - [ ] Per-round tracing of predictions and confidence for debugging emergence.

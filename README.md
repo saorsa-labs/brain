@@ -2,7 +2,7 @@
 
 > A distributed, prompt-based **cortical mesh simulator** written in Rust — implementing the organizational principles of Jeff Hawkins' *Thousand Brains Theory of Intelligence* as a multi-agent system.
 
-[![status](https://img.shields.io/badge/status-phase%202%20done-brightgreen)](docs/ROADMAP.md)
+[![status](https://img.shields.io/badge/status-structured%20lateral%20validated%20(4%E2%80%93150%20cols)-brightgreen)](docs/ROADMAP.md)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange)](#getting-started)
 
@@ -179,9 +179,35 @@ would turn this pilot signal into evidence.
 
 ## Status
 
-Phases 0–2 are complete and panic-free. The workspace implements the domain
+Phases 0–3 are complete and panic-free. The workspace implements the domain
 model, a shared `InferenceEngine` client, the three-phase epoch loop with
-lateral context injection and metric-based convergence, and a `ptg` CLI.
+lateral context injection and metric-based convergence, pluggable topologies,
+attention-routed lateral connections, and a `ptg` CLI.
+
+### Benchmark result (directional, pre-registered)
+
+A full benchmark + judge methodology (see
+[`docs/BENCHMARKING.md`](./docs/BENCHMARKING.md)) was used to test whether the
+lateral-exchange mechanism improves answer quality over an equal-call
+no-lateral control. The honest arc:
+
+- **Raw** lateral-text exchange is quality-neutral to negative (4-col coin flip;
+  150-col 14% win, 57% echo leakage). Do not scale the raw medium.
+- **Structured** lateral exchange (bounded claim-excerpt + synthesis directive)
+  on a 4B-class model is quality-positive and **saturates at ~80–85%** across
+  4 → 50 → 150 columns: 78% → 85% → **82.4%** (powered 150-col, CI [78%, 86%],
+  p ≈ 0), with echo under 10% and length-confounding ruled out.
+
+Caveats are documented in the findings docs (notably 20% mesh-run survivorship
+at 150 cols from HTTP-500 failures in math columns). Cite
+[`STRUCTURED_LATERAL_E4B_150COL_POWERED.md`](./docs/STRUCTURED_LATERAL_E4B_150COL_POWERED.md)
+for the headline, not the directional 1p1r figure.
+
+Next — survivorship follow-up, the A4 self-revision control, and full semantic
+convergence (blocked on the embeddings endpoint) — are tracked in the
+[roadmap](docs/ROADMAP.md).
+
+### Earlier phases
 
 **Phase 2** added: a `Stimulus` model (text + multimodal image/audio serializing
 to the OpenAI content-array shapes), per-sphere reference-frame schema
@@ -191,10 +217,6 @@ was **validated end-to-end against a live `llama.cpp` server** (`gemma-4-e4b`):
 a 2-tick text epoch converged in 1 tick at mean confidence 0.94 with all four
 columns passing strict per-sphere validation. 32 unit tests; clippy-clean
 (`-D warnings`).
-
-Next phases — weighted/attention routing, full semantic convergence, true
-multimodal *live* validation, and benchmarks — are tracked in the
-[roadmap](docs/ROADMAP.md).
 
 ## Documentation
 
