@@ -241,6 +241,13 @@ struct Args {
     /// instead. See `docs/STRUCTURED_LATERAL_EXPERIMENT.md`.
     #[arg(long = "lateral-mode", value_enum, default_value_t = LateralKind::Raw)]
     lateral_mode: LateralKind,
+    /// Cap on concurrently in-flight column ticks against the inference server
+    /// (§6 Phase 1+2). A 150-column mesh fires up to 150 concurrent requests
+    /// unbounded, which overwhelms a single/few-slot llama-server (transport
+    /// errors + task-cancellation bursts). Default `4` matches the e4b auto
+    /// slot count; raise for many-slot servers. Only affects mesh conditions.
+    #[arg(long = "column-concurrency", default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
+    column_concurrency: u32,
 }
 
 /// One answer-producing run.
@@ -296,6 +303,10 @@ struct AnswerRunRecord {
     /// structured-lateral experiment is reproducible. "raw" for non-mesh
     /// conditions where lateral exchange never runs.
     lateral_mode: String,
+    /// Cap on concurrent in-flight column ticks (recorded for reproducibility).
+    /// Applied to all mesh conditions; the no-lateral control uses the same
+    /// cap so A3 scheduling is fair.
+    column_concurrency: u32,
     /// Topology label (`"default"`, `"ring"`, `"small-world"`, ...).
     topology: String,
     /// Number of columns in the mesh (`None` for monolithic conditions).
@@ -601,6 +612,7 @@ async fn run_one(
         integration_threshold: None,
         routing_policy: cond_routing_label(cond, args),
         lateral_mode: args.lateral_mode.label().to_string(),
+        column_concurrency: args.column_concurrency,
         topology: String::new(),
         column_count: None,
         edge_count: None,
@@ -725,6 +737,7 @@ async fn run_mesh(
     mesh.criteria.min_ticks = args.min_ticks;
     mesh.routing_policy = args.routing_policy.to_policy(args.routing_k);
     mesh.lateral_context_mode = args.lateral_mode.to_mode();
+    apply_column_concurrency(&mut mesh, args.column_concurrency);
     let threshold = mesh.criteria.min_integration_confidence;
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
     let final_active = active_listeners_for_tick(result.tick_outputs.last());
@@ -759,6 +772,7 @@ async fn run_mesh_second_look_no_lateral(
     mesh.criteria.max_ticks = args.max_ticks;
     mesh.criteria.min_ticks = args.min_ticks;
     disable_lateral_context(&mut mesh);
+    apply_column_concurrency(&mut mesh, args.column_concurrency);
     let threshold = mesh.criteria.min_integration_confidence;
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
     let final_active = active_listeners_for_tick(result.tick_outputs.last());
@@ -778,6 +792,14 @@ async fn run_mesh_second_look_no_lateral(
         tick_outputs,
     };
     Ok((serde_json::Value::Array(outputs), extras))
+}
+
+fn apply_column_concurrency(mesh: &mut ptg_runtime::CorticalMesh, concurrency: u32) {
+    // clap `range(1..)` guarantees concurrency >= 1, so NonZeroUsize::new is
+    // always Some here; the if-let avoids any panic-prone unwrap.
+    if let Some(cc) = std::num::NonZeroUsize::new(concurrency as usize) {
+        mesh.max_concurrent_column_ticks = Some(cc);
+    }
 }
 
 fn disable_lateral_context(mesh: &mut ptg_runtime::CorticalMesh) {
@@ -800,6 +822,7 @@ async fn run_mesh_one_tick(
 ) -> Result<(serde_json::Value, MeshExtras), String> {
     let mut mesh = build_mesh(engine.clone(), args)?;
     mesh.criteria.max_ticks = 1;
+    apply_column_concurrency(&mut mesh, args.column_concurrency);
     let threshold = mesh.criteria.min_integration_confidence;
     let result = mesh.run_epoch(stimulus).await.map_err(|e| e.to_string())?;
     let final_active = active_listeners_for_tick(result.tick_outputs.last());
@@ -1056,6 +1079,10 @@ fn build_summary(args: &Args, records: &[AnswerRunRecord], ts: u64) -> String {
     s.push_str(&format!(
         "- Lateral mode: `{}` (mesh_adaptive only)\n",
         args.lateral_mode.label()
+    ));
+    s.push_str(&format!(
+        "- Column concurrency: `{}` (in-flight column ticks per tick, mesh conditions)\n",
+        args.column_concurrency
     ));
     s.push_str(&format!(
         "- Conditions: {}  Repeats/prompt: {}\n",

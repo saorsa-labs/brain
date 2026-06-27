@@ -4,6 +4,19 @@
 > The 150-column structured-e4b scale test could not be completed because the
 > e4b inference server fails reproducibly ~80-90% through the mesh arm.
 
+## UPDATE: root cause found and fixed — 150 cols now UNBLOCKED
+
+The ceiling was **not** a server capacity limit. It was **unbounded client
+fan-out**: the runtime's `join_all` over all columns fired 150 concurrent
+requests, overwhelming the server's connection handling (transport errors +
+task-cancellation bursts). Diagnosis and fix are in
+[`E4B_SERVER_TUNING.md`](./E4B_SERVER_TUNING.md).
+
+Fix: `--column-concurrency 4` bounds in-flight column ticks. Validated: a fresh
+4-slot e4b server ran mesh-only 150 cols at 300/300 with 0 errors. 150-col
+quality runs are now possible. (The conclusions below from the failed attempts
+remain valid as the pre-fix record.)
+
 ## What was attempted
 
 Three attempts to run the A3 comparison (mesh_adaptive vs

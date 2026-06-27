@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::future::join_all;
+use futures::stream;
+use futures::stream::StreamExt;
 use ndarray::Array1;
 use ptg_consensus::{
     confidence_converged, confidence_vector, mean_confidence, prediction_similarity_converged,
@@ -132,6 +133,16 @@ pub struct CorticalMesh {
     /// How a source prediction is rendered when injected laterally. Default
     /// `Raw`. See `LateralContextMode` and the structured-lateral experiment.
     pub lateral_context_mode: LateralContextMode,
+    /// Cap on concurrently in-flight column ticks within one tick of the epoch
+    /// loop (§6 Phase 1+2). `None` = unbounded (the original `join_all`
+    /// behavior, fine for small meshes / fast engines). Bounding is required
+    /// when many columns fan out against a single-slot or few-slot inference
+    /// server: an unbounded `join_all` over N columns opens up to N concurrent
+    /// HTTP requests, which overwhelms the server's connection/task handling
+    /// (observed: transport errors + task-cancellation bursts at 150 columns
+    /// on a 4B llama-server; 50 columns was fine). A bound matching the
+    /// server's slot count (e.g. 4) eliminates the backlog.
+    pub max_concurrent_column_ticks: Option<std::num::NonZeroUsize>,
 }
 
 impl CorticalMesh {
@@ -145,6 +156,7 @@ impl CorticalMesh {
             criteria: ConvergenceCriteria::default(),
             routing_policy: RoutingPolicy::default(),
             lateral_context_mode: LateralContextMode::default(),
+            max_concurrent_column_ticks: None,
         }
     }
 
@@ -353,7 +365,15 @@ impl CorticalMesh {
                 tasks.push((id.clone(), col, routed.text));
             }
 
-            // Phase 1 + 2 exec: concurrent column ticks against the shared engine.
+            // Phase 1 + 2 exec: column ticks against the shared engine, with an
+            // optional cap on concurrent in-flight requests. `buffered(limit)`
+            // preserves result order (deterministic column order, same as the
+            // previous `join_all`), unlike `buffer_unordered`. When no cap is
+            // set, limit == task_count, i.e. the original unbounded behavior.
+            let task_count = tasks.len();
+            let limit = self
+                .max_concurrent_column_ticks
+                .map_or(task_count, |n| n.get().min(task_count));
             let futures = tasks.into_iter().map(|(id, col, ctx)| {
                 let engine = Arc::clone(&engine);
                 let stimulus = stimulus.clone();
@@ -362,7 +382,10 @@ impl CorticalMesh {
                     (id, result)
                 }
             });
-            let results = join_all(futures).await;
+            let results = stream::iter(futures)
+                .buffered(limit)
+                .collect::<Vec<_>>()
+                .await;
 
             // Phase 3 prep: apply results, fail-fast on engine errors.
             last_outputs.clear();
@@ -692,6 +715,38 @@ mod tests {
             assert!(mesh.add_column(c).is_ok(), "test setup: add_column");
         }
         mesh
+    }
+
+    /// Concurrency-tracking mock: increments an active counter on entry, sleeps
+    /// briefly so overlap is observable, records the max concurrent in-flight
+    /// ticks, then decrements. Used to assert `max_concurrent_column_ticks`.
+    struct ConcurrencyEngine {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ColumnEngine for ConcurrencyEngine {
+        async fn execute_column_tick(
+            &self,
+            column: &CorticalColumn,
+            _stimulus: &ptg_core::Stimulus,
+            _lateral: &str,
+        ) -> Result<ColumnOutputSchema, VllmEngineError> {
+            use std::sync::atomic::Ordering;
+            let cur = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            // Record the high-water mark of concurrent in-flight ticks.
+            let _ = self.max_seen.fetch_max(cur, Ordering::SeqCst);
+            // Yield + sleep so multiple futures overlap within the scheduler.
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(ColumnOutputSchema {
+                reference_frame_coordinates: format!("coord-{}", column.id),
+                prediction: format!("{}-prediction", column.sphere.as_str()),
+                confidence: 0.95,
+                domain_fields: std::collections::BTreeMap::new(),
+            })
+        }
     }
 
     #[test]
@@ -1216,5 +1271,62 @@ mod tests {
         let mesh = default_mesh(Arc::new(MockEngine))?;
         assert_eq!(mesh.lateral_context_mode, LateralContextMode::Raw);
         Ok(())
+    }
+
+    // --- Bounded column concurrency (E4B_SERVER_TUNING) --------------------
+
+    #[tokio::test]
+    async fn bounded_concurrency_caps_in_flight_column_ticks() {
+        // 10 columns, cap at 3 concurrent -> max_seen must never exceed 3.
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Arc::new(ConcurrencyEngine {
+            active: Arc::clone(&active),
+            max_seen: Arc::clone(&max_seen),
+        });
+        let mut mesh = CorticalMesh::new(engine);
+        for col in ptg_core::replicated_default_columns(10) {
+            assert!(mesh.add_column(col).is_ok(), "test setup: add_column");
+        }
+        let cap = std::num::NonZeroUsize::new(3);
+        assert!(cap.is_some(), "3 is nonzero");
+        mesh.max_concurrent_column_ticks = cap;
+        mesh.criteria.min_ticks = 1;
+        mesh.criteria.max_ticks = 1;
+        let res = mesh.run_text_epoch("stimulus").await;
+        assert!(res.is_ok(), "epoch runs");
+        assert_eq!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "concurrency must be capped at 3, got {}",
+            max_seen.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_concurrency_default_runs_all_columns() {
+        // Default (None) must keep the original unbounded behavior: all columns
+        // run concurrently when the engine sleeps, so max_seen reaches 10.
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Arc::new(ConcurrencyEngine {
+            active: Arc::clone(&active),
+            max_seen: Arc::clone(&max_seen),
+        });
+        let mut mesh = CorticalMesh::new(engine);
+        for col in ptg_core::replicated_default_columns(10) {
+            assert!(mesh.add_column(col).is_ok(), "test setup: add_column");
+        }
+        // max_concurrent_column_ticks defaults to None (unbounded).
+        mesh.criteria.min_ticks = 1;
+        mesh.criteria.max_ticks = 1;
+        let res = mesh.run_text_epoch("stimulus").await;
+        assert!(res.is_ok(), "epoch runs");
+        assert_eq!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst),
+            10,
+            "unbounded default should run all 10 concurrently, got {}",
+            max_seen.load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }
