@@ -4,6 +4,11 @@ name: release
 # for Linux, macOS (arm64 + x86_64), and Windows whenever a v* tag is pushed,
 # smoke-tests each binary actually runs, and attaches the archives to the
 # GitHub Release for that tag.
+#
+# Note on macOS x86_64: it is cross-compiled on the arm64 (macos-latest) runner
+# using Apple's universal toolchain, which avoids the long queue / availability
+# problems of dedicated Intel (macos-13) runners. Its smoke test is therefore
+# skipped (the host cannot execute the foreign arch without Rosetta).
 
 on:
   push:
@@ -24,19 +29,20 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-            bin_ext: ""
+            smoke: true
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-            bin_ext: ""
-          - os: macos-13
+            smoke: true
+          # Cross-compiled from the arm64 runner above.
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
-            bin_ext: ""
+            smoke: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-            bin_ext: ".exe"
+            smoke: true
 
     steps:
       - name: Checkout
@@ -56,7 +62,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} -p ptg-cli
 
       - name: Smoke test binaries (unix)
-        if: matrix.archive != 'zip'
+        if: matrix.smoke && matrix.archive != 'zip'
         run: |
           set -e
           bindir="target/${{ matrix.target }}/release"
@@ -71,7 +77,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Smoke test binaries (windows)
-        if: matrix.archive == 'zip'
+        if: matrix.smoke && matrix.archive == 'zip'
         shell: pwsh
         run: |
           $bindir = "target/${{ matrix.target }}/release"
@@ -98,12 +104,10 @@ jobs:
         shell: pwsh
         run: |
           $staging = "ptg-${{ github.ref_name }}-${{ matrix.target }}"
+          $bindir = "target/${{ matrix.target }}/release"
           New-Item -ItemType Directory -Force -Path "$staging/bin" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/ptg.exe" `
-                    "target/${{ matrix.target }}/release/ptg-bench.exe" `
-                    "target/${{ matrix.target }}/release/ptg-judge.exe" `
-                    -Destination "$staging/bin/"
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE -Destination "$staging/" -ErrorAction SilentlyContinue
+          Copy-Item -Path "$bindir/ptg.exe","$bindir/ptg-bench.exe","$bindir/ptg-judge.exe" -Destination "$staging/bin/"
+          Copy-Item -Path README.md,LICENSE-MIT,LICENSE-APACHE -Destination "$staging/" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$staging" -DestinationPath "$staging.zip"
           "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
