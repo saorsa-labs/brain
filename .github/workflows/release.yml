@@ -88,7 +88,7 @@ jobs:
           (& "$bindir/ptg-bench.exe" --help | Select-Object -First 1)
           (& "$bindir/ptg-judge.exe" --help | Select-Object -First 1)
           # The setup phase must run on Windows too (no network in --dry-run).
-          & "$bindir/ptg.exe" setup --dry-run --gguf-dir "$env:TEMP\ptg-smoke-gguf
+          & "$bindir/ptg.exe" setup --dry-run --gguf-dir "$env:TEMP\ptg-smoke-gguf"
 
       - name: Stage package (unix)
         if: matrix.archive != 'zip'
