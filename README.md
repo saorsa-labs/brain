@@ -54,6 +54,30 @@ brain/
 > verified Gemma 4 QAT server, run your first cortical mesh, and edit column
 > packs for abstraction-level experiments.
 
+### Install the CLI suite
+
+Pre-built `ptg`, `ptg-bench`, and `ptg-judge` binaries for Linux, macOS
+(arm64 + x86_64), and Windows are attached to each
+[GitHub release](https://github.com/saorsa-labs/brain/releases):
+
+```bash
+# Example: download the latest release for this platform, then run
+tar xzf ptg-v0.3.0-<your-target>.tar.gz
+cd ptg-v0.3.0-<your-target>/bin
+./ptg --version        # the cortical mesh runner
+./ptg-bench --help     # the benchmark harness (A1/A2/A3 conditions)
+./ptg-judge --help     # the judge (perturbation delta + blind LLM)
+```
+
+Or build from source (Rust 1.85+):
+
+```bash
+cargo build --release -p ptg-cli   # binaries land in target/release/{ptg,ptg-bench,ptg-judge}
+```
+
+The CLIs need a local inference server (llama.cpp or vLLM) serving a Gemma
+model — see the model-setup tiers below.
+
 ### Model setup (3 tiers)
 
 | Tier | Model | Memory | Notes |
