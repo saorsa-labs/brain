@@ -75,6 +75,9 @@ jobs:
           echo "::group::ptg-judge --help"
           "$bindir/ptg-judge" --help | head -n 1
           echo "::endgroup::"
+          echo "::group::ptg setup --dry-run (setup phase runs on this platform)"
+          "$bindir/ptg" setup --dry-run --gguf-dir /tmp/ptg-smoke-gguf
+          echo "::endgroup::"
 
       - name: Smoke test binaries (windows)
         if: matrix.smoke && matrix.archive == 'zip'
@@ -84,6 +87,8 @@ jobs:
           & "$bindir/ptg.exe" --version
           (& "$bindir/ptg-bench.exe" --help | Select-Object -First 1)
           (& "$bindir/ptg-judge.exe" --help | Select-Object -First 1)
+          # The setup phase must run on Windows too (no network in --dry-run).
+          & "$bindir/ptg.exe" setup --dry-run --gguf-dir "$env:TEMP\ptg-smoke-gguf
 
       - name: Stage package (unix)
         if: matrix.archive != 'zip'
