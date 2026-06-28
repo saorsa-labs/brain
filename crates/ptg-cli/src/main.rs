@@ -13,6 +13,7 @@ use ptg_core::{ImageDetail, ImageUrlRef, Stimulus};
 use ptg_runtime::{default_mesh, mesh_from_columns};
 use ptg_vllm::{list_models, ColumnEngine, InferenceEngine};
 
+use ptg_cli::setup::{load_config, PhaseCommand};
 use ptg_cli::topology_cli::{MeshPlan, MeshTopologyParams, TopologyKind};
 
 /// Default stimulus from the reference wiring (§8.4).
@@ -26,17 +27,20 @@ const DEFAULT_INPUT: &str = "Anomalous kinetic energy burst detected tracking at
     about = "Project Thousand-Gemma: a distributed, prompt-based cortical mesh simulator"
 )]
 struct Cli {
-    /// Base URL of the local OpenAI-compatible "thalamus" server.
-    #[arg(long, env = "PTG_VLLM_URL", default_value = "http://localhost:8000")]
-    vllm_url: String,
+    /// Optional phase subcommand. With no subcommand, `ptg` runs a mesh against
+    /// the configured server (use `ptg setup` / `ptg serve` to prepare it).
+    #[command(subcommand)]
+    command: Option<PhaseCommand>,
+    /// Base URL of the local OpenAI-compatible "thalamus" server. If unset,
+    /// falls back to the value written by `ptg setup`, then to
+    /// `http://localhost:8000`.
+    #[arg(long, env = "PTG_VLLM_URL")]
+    vllm_url: Option<String>,
 
-    /// Model id served by the engine (§7.1).
-    #[arg(
-        long,
-        env = "PTG_MODEL",
-        default_value = "solidrust/Gemma-4-2B-Multimodal-Q4_K_M"
-    )]
-    model: String,
+    /// Model id served by the engine (§7.1). If unset, falls back to the alias
+    /// written by `ptg setup`, then to the bundled default.
+    #[arg(long, env = "PTG_MODEL")]
+    model: Option<String>,
 
     /// Maximum number of consensus ticks per epoch.
     #[arg(long, default_value_t = 5)]
@@ -197,6 +201,30 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
     let cli = Cli::parse();
+    // Phase subcommands short-circuit before the mesh path.
+    if let Some(phase) = cli.command {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let rt = match rt {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("ptg: failed to start runtime: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let result = match phase {
+            PhaseCommand::Setup(args) => rt.block_on(ptg_cli::setup::run_setup(args)),
+            PhaseCommand::Serve(args) => rt.block_on(ptg_cli::setup::run_serve(args)),
+        };
+        return match result {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("ptg: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     // Run on a single-threaded runtime: the mesh uses join_all, not spawn.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -227,6 +255,20 @@ fn parse_detail(s: &str) -> Result<ImageDetail, String> {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sync>> {
+    // Resolve server URL / model in priority order: explicit flag > env > the
+    // config written by `ptg setup` > bundled defaults. This is what makes
+    // "`ptg setup` once, then just `ptg`" work.
+    let cfg = load_config();
+    let vllm_url = cli
+        .vllm_url
+        .clone()
+        .or_else(|| cfg.as_ref().map(|c| c.server_url()))
+        .unwrap_or_else(|| "http://localhost:8000".to_string());
+    let model = cli
+        .model
+        .clone()
+        .or_else(|| cfg.as_ref().map(|c| c.model_alias.clone()))
+        .unwrap_or_else(|| "solidrust/Gemma-4-2B-Multimodal-Q4_K_M".to_string());
     if let Some(sim) = cli.min_prediction_similarity {
         if !(0.0..=1.0).contains(&sim) {
             return Err(
@@ -238,8 +280,8 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
 
     if cli.dry_run {
         println!("PTG dry run — no inference will be performed.");
-        println!("  vLLM URL : {}", cli.vllm_url);
-        println!("  model    : {}", cli.model);
+        println!("  vLLM URL : {vllm_url}");
+        println!("  model    : {model}");
         println!("  ticks    : {}", cli.ticks);
         match topology_plan(&cli)? {
             None => {
@@ -289,7 +331,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
         return Ok(ExitCode::SUCCESS);
     }
 
-    let engine = InferenceEngine::builder(&cli.vllm_url, &cli.model)
+    let engine = InferenceEngine::builder(&vllm_url, &model)
         .max_tokens(cli.max_tokens)
         .temperature(cli.temperature)
         .build()?;
@@ -297,18 +339,15 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error + Send + Sy
     if cli.probe {
         let models = list_models(engine.http_client(), engine.vllm_url()).await?;
         if models.is_empty() {
-            println!("reachable, but no models served at {}", cli.vllm_url);
+            println!("reachable, but no models served at {vllm_url}");
             return Ok(ExitCode::SUCCESS);
         }
-        println!("reachable: {} model(s) at {}", models.len(), cli.vllm_url);
+        println!("reachable: {} model(s) at {}", models.len(), vllm_url);
         for m in &models {
             println!("  - {m}");
         }
-        if !models.iter().any(|m| m == &cli.model) {
-            eprintln!(
-                "warning: requested model `{}` is not in the served list",
-                cli.model
-            );
+        if !models.iter().any(|m| m == &model) {
+            eprintln!("warning: requested model `{model}` is not in the served list");
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -403,8 +442,9 @@ mod tests {
 
     fn test_cli(topology: TopologyKind, columns: Option<usize>) -> Cli {
         Cli {
-            vllm_url: String::new(),
-            model: String::new(),
+            command: None,
+            vllm_url: None,
+            model: None,
             ticks: 5,
             min_ticks: 1,
             max_tokens: 1024,

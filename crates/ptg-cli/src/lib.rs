@@ -3,4 +3,5 @@
 //! logic so all three binaries share a single source of truth.
 
 pub mod column_pack;
+pub mod setup;
 pub mod topology_cli;

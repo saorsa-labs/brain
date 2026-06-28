@@ -39,7 +39,14 @@ envelope; the abstraction level lives in the prompt text.
   pip install huggingface-hub && hf login   # paste your HF token
   ```
 
-No `cargo install` is needed — everything runs via `cargo run -p ptg-cli`.
+No `cargo install` is needed — everything runs via `cargo run -p ptg-cli`, or
+via the prebuilt `ptg` binary from the
+[releases](https://github.com/saorsa-labs/brain/releases).
+
+> **Faster path:** once the prerequisites above are met, `ptg setup --yes`
+> then `ptg serve` does steps 3–4 for you (model download + server launch) and
+> writes a config so later `ptg` commands need no flags. The manual steps
+> below remain for reference and for choosing non-default model tiers.
 
 ---
 
@@ -61,6 +68,20 @@ No `cargo install` is needed — everything runs via `cargo run -p ptg-cli`.
 
 ## 4. Start the server
 
+**Recommended (CLI setup phase):**
+
+```bash
+ptg setup --yes   # detect server, download model, write config
+ptg serve         # foreground; leave running
+```
+
+`ptg setup` detects your `llama-server` binary, downloads the QAT model if
+needed (first run: ~2.7 GB), and writes `~/.config/ptg/config.toml`. `ptg
+serve` launches the server on `http://127.0.0.1:18136`. Leave it running in one
+terminal. (`ptg setup`/`ptg serve` accept `--dry-run` to preview.)
+
+**Legacy (bash script, same effect):**
+
 ```bash
 scripts/start-gemma4-qat.sh
 ```
@@ -72,6 +93,8 @@ running in one terminal.
 In another terminal, probe it:
 
 ```bash
+ptg --probe        # if you ran `ptg setup` — config is remembered
+# or explicitly:
 cargo run -p ptg-cli --bin ptg -- \
     --probe \
     --vllm-url http://127.0.0.1:18136 \

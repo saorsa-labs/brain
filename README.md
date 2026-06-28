@@ -50,9 +50,8 @@ brain/
 
 ## Getting started
 
-> **Start here:** follow [`docs/TUTORIAL.md`](docs/TUTORIAL.md) to start the
-> verified Gemma 4 QAT server, run your first cortical mesh, and edit column
-> packs for abstraction-level experiments.
+> **Start here:** the quick start below, or [`docs/TUTORIAL.md`](docs/TUTORIAL.md)
+> for the long-form version (abstraction-level experiments, column packs).
 
 ### Install the CLI suite
 
@@ -75,18 +74,56 @@ Or build from source (Rust 1.85+):
 cargo build --release -p ptg-cli   # binaries land in target/release/{ptg,ptg-bench,ptg-judge}
 ```
 
-The CLIs need a local inference server (llama.cpp or vLLM) serving a Gemma
-model — see the model-setup tiers below.
+The CLIs need a local inference server (llama.cpp) serving a Gemma model.
+`ptg` can set this up for you — see the quick start below.
+
+### Quick start: `ptg setup` + `ptg serve`
+
+`ptg` ships a setup phase that prepares the local environment for you:
+detects `llama-server`, downloads the verified Gemma QAT model into the cache,
+and writes a config (`~/.config/ptg/config.toml`) that the other commands read.
+After that, running a mesh is a one-liner.
+
+```bash
+# 1. Prepare: detect server, download model (~2.7 GB), write config
+ptg setup --yes
+
+# 2. Start the inference server (foreground; leave it running)
+ptg serve
+
+# 3. In another terminal, run a mesh — no flags needed, config is remembered
+ptg --probe                            # verify the server
+ptg --topology ring --columns 4        # your first mesh
+```
+
+**Two prerequisites `ptg setup` does NOT do for you** (documented honestly,
+not hidden):
+
+- **`llama-server`** must be installed and findable (PATH, `PTG_LLAMA_SERVER`,
+  `~/llama-spike/llama.cpp/build/bin/`, or `~/.cache/ptg/bin/`). `ptg setup`
+  detects it and prints exact install instructions if missing — it does **not**
+  build it (that is GPU/platform-specific). Install from
+  [llama.cpp](https://github.com/ggml-org/llama.cpp).
+- **Gemma is gated.** Accept the license at the model's HuggingFace page, then
+  authenticate: run `hf login` (or `huggingface-cli login`) — or set `HF_TOKEN`.
+  `ptg setup` uses this token **only** for the download and never persists it.
+
+Both `ptg setup` and `ptg serve` accept `--dry-run` to preview exactly what
+they'll do.
 
 ### Model setup (3 tiers)
 
 | Tier | Model | Memory | Notes |
 |------|-------|--------|-------|
-| **Default** | `unsloth/gemma-4-E2B-it-qat-GGUF` (QAT) | ~2.7 GB | 3× less memory, drop-in GGUF. Start here. |
+| **Default** | `unsloth/gemma-4-E2B-it-qat-GGUF` (QAT) | ~2.7 GB | 3× less memory, drop-in GGUF. `ptg setup` default. |
 | Fallback | `ggml-org/gemma-4-E2B-it-GGUF:Q4_K_M` | ~3.5 GB | Balanced default if QAT unavailable. |
 | Scaling | TurboQuant KV-cache ([fork](https://github.com/TheTom/llama-cpp-turboquant)) | 6× KV cache | Past the memory wall; not drop-in. |
 
 ```bash
+# The modern flow (recommended):
+ptg setup --yes   # then: ptg serve
+
+# The legacy flow (still works; what ptg setup/serve were ported from):
 scripts/start-gemma4-qat.sh          # start the QAT model server (port 18136)
 cargo run -p ptg-cli --bin ptg -- --probe \
     --vllm-url http://127.0.0.1:18136 --model gemma-4-e2b-qat
