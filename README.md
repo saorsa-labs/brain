@@ -83,12 +83,14 @@ cd ptg-v0.3.1-x86_64-pc-windows-msvc\bin
 .\ptg.exe --version
 ```
 
-> macOS binaries in the latest release are **Apple Developer ID signed**
-> (verify with `codesign --verify --strict <binary>` — valid chain to Apple Root
-> CA, hardened runtime). They are submitted for notarization; the notarization
-> ticket is **not stapled** to the binary, so a first run on a locked-down Mac
-> may show a Gatekeeper prompt that resolves once online. Linux/Windows
-> binaries are unsigned.
+> macOS binaries in the latest release are **Apple Developer ID signed and
+> notarized, with the notarization ticket stapled** — clean first run with no
+> Gatekeeper prompt. Verify after download:
+> ```bash
+> codesign --verify --strict ./ptg        # signature valid
+> xcrun stapler validate ./ptg            # notarization ticket present
+> ```
+> Linux/Windows binaries are unsigned.
 
 Or build from source (Rust 1.85+):
 
