@@ -53,20 +53,40 @@ brain/
 > **Start here:** the quick start below, or [`docs/TUTORIAL.md`](docs/TUTORIAL.md)
 > for the long-form version (abstraction-level experiments, column packs).
 
-### Install the CLI suite
+### 1. Install the CLI suite
 
-Pre-built `ptg`, `ptg-bench`, and `ptg-judge` binaries for Linux, macOS
-(arm64 + x86_64), and Windows are attached to each
-[GitHub release](https://github.com/saorsa-labs/brain/releases):
+Download the latest release for your platform from the
+[releases page](https://github.com/saorsa-labs/brain/releases). You need
+**v0.3.1+** for the `setup`/`serve` phases below — older releases don't have
+them.
+
+| Platform | Asset |
+|---|---|
+| Linux (x86_64) | `ptg-v0.3.1-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS — Apple Silicon (M-series) | `ptg-v0.3.1-aarch64-apple-darwin.tar.gz` |
+| macOS — Intel | `ptg-v0.3.1-x86_64-apple-darwin.tar.gz` |
+| Windows (x86_64) | `ptg-v0.3.1-x86_64-pc-windows-msvc.zip` |
 
 ```bash
-# Example: download the latest release for this platform, then run
-tar xzf ptg-v0.3.0-<your-target>.tar.gz
-cd ptg-v0.3.0-<your-target>/bin
+# Linux / macOS
+tar xzf ptg-v0.3.1-<your-target>.tar.gz
+cd ptg-v0.3.1-<your-target>/bin
 ./ptg --version        # the cortical mesh runner
 ./ptg-bench --help     # the benchmark harness (A1/A2/A3 conditions)
 ./ptg-judge --help     # the judge (perturbation delta + blind LLM)
 ```
+
+```powershell
+# Windows
+Expand-Archive ptg-v0.3.1-x86_64-pc-windows-msvc.zip
+cd ptg-v0.3.1-x86_64-pc-windows-msvc\bin
+.\ptg.exe --version
+```
+
+> macOS binaries in the latest release are **Apple Developer ID signed and
+> notarized** when the build has access to the `saorsa-labs` org Apple-signing
+> secrets; verify with `codesign -dv --strict <binary>` after download.
+> Linux/Windows binaries are unsigned.
 
 Or build from source (Rust 1.85+):
 
@@ -74,18 +94,33 @@ Or build from source (Rust 1.85+):
 cargo build --release -p ptg-cli   # binaries land in target/release/{ptg,ptg-bench,ptg-judge}
 ```
 
-The CLIs need a local inference server (llama.cpp) serving a Gemma model.
-`ptg` can set this up for you — see the quick start below.
+### 2. Meet the two prerequisites
 
-### Quick start: `ptg setup` + `ptg serve`
+`ptg` can set up its runtime for you, but two things must be in place first
+(neither is automated — they're honest prerequisites, documented up front):
 
-`ptg` ships a setup phase that prepares the local environment for you:
-detects `llama-server`, downloads the verified Gemma QAT model into the cache,
-and writes a config (`~/.config/ptg/config.toml`) that the other commands read.
-After that, running a mesh is a one-liner.
+1. **`llama-server`** must be installed and findable — in `PATH`, via the
+   `PTG_LLAMA_SERVER` env var, at `~/llama-spike/llama.cpp/build/bin/`, or at
+   `~/.cache/ptg/bin/`. Build it from
+   [llama.cpp](https://github.com/ggml-org/llama.cpp):
+   ```bash
+   git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+   cmake -B build && cmake --build build --config Release
+   # binary: build/bin/llama-server
+   ```
+2. **Accept the Gemma license** (Gemma is gated). Go to the model's
+   HuggingFace page, accept the license, then authenticate — either run
+   `hf login` (or `huggingface-cli login`) or set the `HF_TOKEN` env var.
+
+### 3. Quick start: `ptg setup` + `ptg serve`
+
+With the prerequisites met, `ptg` prepares everything else: it detects
+`llama-server`, downloads the verified Gemma QAT model (~2.7 GB) into the
+cache, and writes a config (`~/.config/ptg/config.toml`) that the other
+commands read. After that, running a mesh is a one-liner.
 
 ```bash
-# 1. Prepare: detect server, download model (~2.7 GB), write config
+# 1. Prepare: detect server, download model, write config
 ptg setup --yes
 
 # 2. Start the inference server (foreground; leave it running)
@@ -96,20 +131,10 @@ ptg --probe                            # verify the server
 ptg --topology ring --columns 4        # your first mesh
 ```
 
-**Two prerequisites `ptg setup` does NOT do for you** (documented honestly,
-not hidden):
-
-- **`llama-server`** must be installed and findable (PATH, `PTG_LLAMA_SERVER`,
-  `~/llama-spike/llama.cpp/build/bin/`, or `~/.cache/ptg/bin/`). `ptg setup`
-  detects it and prints exact install instructions if missing — it does **not**
-  build it (that is GPU/platform-specific). Install from
-  [llama.cpp](https://github.com/ggml-org/llama.cpp).
-- **Gemma is gated.** Accept the license at the model's HuggingFace page, then
-  authenticate: run `hf login` (or `huggingface-cli login`) — or set `HF_TOKEN`.
-  `ptg setup` uses this token **only** for the download and never persists it.
-
-Both `ptg setup` and `ptg serve` accept `--dry-run` to preview exactly what
-they'll do.
+`ptg setup` uses your `HF_TOKEN` **only** for the download and never persists
+it. Both `ptg setup` and `ptg serve` accept `--dry-run` to preview exactly
+what they'll do. If `llama-server` is missing, `ptg setup` detects that and
+prints the install instructions from step 2 above.
 
 ### Model setup (3 tiers)
 

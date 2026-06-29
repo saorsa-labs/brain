@@ -90,6 +90,84 @@ jobs:
           # The setup phase must run on Windows too (no network in --dry-run).
           & "$bindir/ptg.exe" setup --dry-run --gguf-dir "$env:TEMP\ptg-smoke-gguf"
 
+      # ---- macOS Code Signing & Notarization (mirrors x0x release.yml) ----
+      # Requires the org-level secrets MACOS_CERTIFICATE / MACOS_CERTIFICATE_PASSWORD
+      # / KEYCHAIN_PASSWORD / MACOS_SIGNING_IDENTITY (+ notarization triple) to be
+      # scoped to this repo. If the secret is empty the import step fails loudly so
+      # we never silently ship an unsigned binary labelled as signed.
+      - name: Import macOS signing certificate
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "::error::MACOS_CERTIFICATE secret is empty/missing for this repo. "
+            echo "::error::Scope the saorsa-labs org Apple-signing secrets to this repo, "
+            echo "::error::or drop this step. Refusing to ship an unsigned macOS binary."
+            exit 1
+          fi
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          echo "$MACOS_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign macOS binaries
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          for bin in ptg ptg-bench ptg-judge; do
+            BINARY="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BINARY" ]; then
+              codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$BINARY"
+              codesign --verify --deep --strict "$BINARY"
+              echo "Signed ${bin} successfully"
+            fi
+          done
+
+      # Notarization contacts Apple and validates the Developer Program License
+      # Agreement; an expired/unsigned agreement returns HTTP 403 and is an
+      # account-level blocker, not a build defect. Binaries are still codesigned
+      # (the Sign step above uses an offline cert), so an un-notarized macOS
+      # binary is usable with a Gatekeeper prompt. Kept non-blocking so a lapsed
+      # agreement cannot hold back Linux/Windows; re-run after re-signing to
+      # ship notarized macOS. (Mirrors x0x release.yml.)
+      - name: Notarize macOS binaries
+        if: contains(matrix.target, 'apple-darwin')
+        continue-on-error: true
+        env:
+          MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        run: |
+          for bin in ptg ptg-bench ptg-judge; do
+            BINARY="target/${{ matrix.target }}/release/${bin}"
+            if [ -f "$BINARY" ]; then
+              ditto -c -k --keepParent "$BINARY" "$RUNNER_TEMP/notarize-${bin}.zip"
+              if xcrun notarytool submit "$RUNNER_TEMP/notarize-${bin}.zip" \
+                --apple-id "$MACOS_NOTARIZATION_APPLE_ID" \
+                --password "$MACOS_NOTARIZATION_PASSWORD" \
+                --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
+                --wait; then
+                echo "Notarized ${bin} successfully"
+              else
+                echo "::warning::Notarization failed for ${bin} (likely an expired Apple Developer agreement); shipping signed-but-un-notarized binary."
+              fi
+            fi
+          done
+
+      - name: Clean up macOS keychain
+        if: contains(matrix.target, 'apple-darwin') && always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+
       - name: Stage package (unix)
         if: matrix.archive != 'zip'
         run: |
