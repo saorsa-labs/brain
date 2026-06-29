@@ -58,19 +58,23 @@ brain/
 Download the latest release for your platform from the
 [releases page](https://github.com/saorsa-labs/brain/releases). You need
 **v0.3.1+** for the `setup`/`serve` phases below — older releases don't have
-them.
+them. Set `VERSION` to the release you downloaded (e.g. `v0.3.4`):
+
+```bash
+VERSION=v0.3.4   # or whichever release you downloaded
+```
 
 | Platform | Asset |
 |---|---|
-| Linux (x86_64) | `ptg-v0.3.1-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS — Apple Silicon (M-series) | `ptg-v0.3.1-aarch64-apple-darwin.tar.gz` |
-| macOS — Intel | `ptg-v0.3.1-x86_64-apple-darwin.tar.gz` |
-| Windows (x86_64) | `ptg-v0.3.1-x86_64-pc-windows-msvc.zip` |
+| Linux (x86_64) | `ptg-$VERSION-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS — Apple Silicon (M-series) | `ptg-$VERSION-aarch64-apple-darwin.tar.gz` |
+| macOS — Intel | `ptg-$VERSION-x86_64-apple-darwin.tar.gz` |
+| Windows (x86_64) | `ptg-$VERSION-x86_64-pc-windows-msvc.zip` |
 
 ```bash
 # Linux / macOS
-tar xzf ptg-v0.3.1-<your-target>.tar.gz
-cd ptg-v0.3.1-<your-target>/bin
+tar xzf ptg-$VERSION-<your-target>.tar.gz
+cd ptg-$VERSION-<your-target>/bin
 ./ptg --version        # the cortical mesh runner
 ./ptg-bench --help     # the benchmark harness (A1/A2/A3 conditions)
 ./ptg-judge --help     # the judge (perturbation delta + blind LLM)
@@ -78,17 +82,22 @@ cd ptg-v0.3.1-<your-target>/bin
 
 ```powershell
 # Windows
-Expand-Archive ptg-v0.3.1-x86_64-pc-windows-msvc.zip
-cd ptg-v0.3.1-x86_64-pc-windows-msvc\bin
+Expand-Archive "ptg-$env:VERSION-x86_64-pc-windows-msvc.zip"
+cd "ptg-$env:VERSION-x86_64-pc-windows-msvc\bin"
 .\ptg.exe --version
 ```
 
-> macOS binaries in the latest release are **Apple Developer ID signed and
-> notarized, with the notarization ticket stapled** — clean first run with no
-> Gatekeeper prompt. Verify after download:
+> macOS binaries are **Apple Developer ID signed** (valid chain to Apple Root
+> CA, hardened runtime) and **submitted for notarization** (Apple accepts the
+> submission in CI). The notarization ticket is **not stapled** to these bare
+> CLI tarballs — `xcrun stapler` only attaches tickets to `.app`/`.pkg`/`.dmg`
+> artifacts, not Mach-O executables — so a first run on a fully-offline,
+> locked-down Mac may show a one-time Gatekeeper prompt that resolves once
+> online. The signature itself is sufficient for normal CLI use. Verify after
+> download:
 > ```bash
-> codesign --verify --strict ./ptg        # signature valid
-> xcrun stapler validate ./ptg            # notarization ticket present
+> codesign --verify --strict ./ptg        # signature valid (prints nothing on success)
+> codesign -dv ./ptg                      # Authority=Developer ID Application: ...
 > ```
 > Linux/Windows binaries are unsigned.
 

@@ -157,13 +157,11 @@ jobs:
                 --team-id "$MACOS_NOTARIZATION_TEAM_ID" \
                 --wait; then
                 echo "Notarized ${bin} successfully"
-                # Staple the notarization ticket to the binary and validate it
-                # (matches communitas/fae; x0x omits this). Without a staple the
-                # binary is notarized but the ticket isn't embedded, so a first
-                # run offline can hit a Gatekeeper prompt.
-                xcrun stapler staple "$BINARY"
-                xcrun stapler validate "$BINARY"
-                echo "Stapled ${bin} successfully"
+                # NOTE: we deliberately do NOT `xcrun stapler staple` here.
+                # stapler only attaches tickets to .app/.pkg/.dmg artifacts, not
+                # bare Mach-O CLI binaries (Error 73). The binary is notarized
+                # (Apple accepted the submission); a stapled ticket for CLI use
+                # requires a .dmg distribution (tracked as a follow-up).
               else
                 echo "::warning::Notarization failed for ${bin} (likely an expired Apple Developer agreement); shipping signed-but-un-notarized binary."
               fi
